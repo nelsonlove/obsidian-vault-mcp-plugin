@@ -1,0 +1,6 @@
+node_modules/
+main.js
+bridge.mjs
+*.js.map
+.DS_Store
+data.json
