@@ -1,8 +1,11 @@
-import { Plugin, FileSystemAdapter } from "obsidian";
+import * as os from "node:os";
+import * as path from "node:path";
+import { Plugin, FileSystemAdapter, Notice } from "obsidian";
 import { UnixSocketServerTransport } from "./socket-transport.js";
 import { buildMcpServer } from "./mcp/server.js";
-import { vaultSlug, socketPath } from "./paths.js";
+import { vaultSlug, socketPath, bridgeDestPath } from "./paths.js";
 import { writeDiscovery, removeDiscovery, writeBridge, type Discovery } from "./discovery.js";
+import { wireUpClaudeConfig } from "./wire-up.js";
 
 export default class VaultMcpPlugin extends Plugin {
   private transport: UnixSocketServerTransport | null = null;
@@ -41,6 +44,20 @@ export default class VaultMcpPlugin extends Plugin {
     };
     writeDiscovery(this.slug, discovery);
     console.log(`[vault-mcp] listening on ${sock}`);
+
+    this.addCommand({
+      id: "wire-up-claude-code",
+      name: "Wire up Claude Code",
+      callback: () => {
+        try {
+          const configPath = path.join(os.homedir(), ".claude.json");
+          wireUpClaudeConfig({ bridgePath: bridgeDestPath(), vaultName: this.app.vault.getName(), configPath });
+          new Notice("vault-mcp: wrote mcpServers entry to ~/.claude.json. Restart your Claude Code session.");
+        } catch (e) {
+          new Notice(`vault-mcp: wire-up failed — ${(e as Error).message}`);
+        }
+      },
+    });
   }
 
   async onunload() {
