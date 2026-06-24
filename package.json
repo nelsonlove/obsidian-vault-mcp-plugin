@@ -6,7 +6,7 @@
   "scripts": {
     "build": "node esbuild.config.mjs production",
     "dev": "node esbuild.config.mjs",
-    "test": "tsc --noEmit && node --test 'tests/*.test.mjs'"
+    "test": "tsc --noEmit && node --import tsx --test 'tests/*.test.mjs'"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.12.0",
@@ -16,6 +16,7 @@
     "@types/node": "^22.10.0",
     "esbuild": "^0.24.0",
     "obsidian": "^1.6.6",
+    "tsx": "^4.19.0",
     "typescript": "^5.7.0"
   }
 }
