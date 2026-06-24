@@ -21,12 +21,19 @@ export class UnixSocketServerTransport implements Transport {
   async start(): Promise<void> {}
 
   listen(): Promise<void> {
-    return new Promise((resolve, _reject) => {
+    return new Promise((resolve, reject) => {
+      if (this.server) { reject(new Error("already listening")); return; }
       try { fs.unlinkSync(this.socketPath); } catch { /* none */ }
       this.server = net.createServer((conn) => this.attach(conn));
-      this.server.on("error", (e) => this.onerror?.(e));
+      this.server.on("error", (e) => { this.onerror?.(e); reject(e); });
       this.server.listen(this.socketPath, () => {
-        try { fs.chmodSync(this.socketPath, 0o600); } catch { /* best effort */ }
+        try {
+          fs.chmodSync(this.socketPath, 0o600);
+        } catch (e) {
+          this.onerror?.(e as Error);
+          reject(e);
+          return;
+        }
         resolve();
       });
     });
@@ -57,8 +64,9 @@ export class UnixSocketServerTransport implements Transport {
   }
 
   async send(message: JSONRPCMessage, _options?: TransportSendOptions): Promise<void> {
-    if (!this.conn) return; // no client connected; drop
-    this.conn.write(JSON.stringify(message) + "\n");
+    if (!this.conn) return; // no client connected; drop (single-client model)
+    const data = JSON.stringify(message) + "\n";
+    await new Promise<void>((res, rej) => this.conn!.write(data, (err) => err ? rej(err) : res()));
   }
 
   async close(): Promise<void> {
@@ -68,10 +76,9 @@ export class UnixSocketServerTransport implements Transport {
       if (!this.server) return resolve();
       this.server.close(() => resolve());
     });
-    // On macOS, net.Server.close() removes the Unix socket file automatically.
-    // Recreate a plain-file placeholder so callers that want to unlink the path
-    // themselves (e.g. test cleanup) do not get ENOENT.
-    try { fs.writeFileSync(this.socketPath, ""); } catch { /* best effort */ }
+    this.server = null;
+    // Defensive cleanup: some platforms don't auto-remove the socket file.
+    try { fs.unlinkSync(this.socketPath); } catch { /* already gone */ }
     this.onclose?.();
   }
 }
