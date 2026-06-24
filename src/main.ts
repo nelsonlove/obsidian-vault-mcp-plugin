@@ -1,11 +1,20 @@
 import * as os from "node:os";
 import * as path from "node:path";
-import { Plugin, FileSystemAdapter, Notice } from "obsidian";
+import { Plugin, FileSystemAdapter, Notice, Modal } from "obsidian";
 import { UnixSocketServerTransport } from "./socket-transport.js";
 import { buildMcpServer } from "./mcp/server.js";
 import { vaultSlug, socketPath, bridgeDestPath } from "./paths.js";
 import { writeDiscovery, removeDiscovery, writeBridge, type Discovery } from "./discovery.js";
 import { wireUpClaudeConfig } from "./wire-up.js";
+
+class DiagnosticsModal extends Modal {
+  constructor(app: any, private readonly lines: string[]) { super(app); }
+  onOpen() {
+    this.titleEl.setText("vault-mcp diagnostics");
+    for (const l of this.lines) this.contentEl.createEl("p", { text: l });
+  }
+  onClose() { this.contentEl.empty(); }
+}
 
 export default class VaultMcpPlugin extends Plugin {
   private transport: UnixSocketServerTransport | null = null;
@@ -56,6 +65,22 @@ export default class VaultMcpPlugin extends Plugin {
         } catch (e) {
           new Notice(`vault-mcp: wire-up failed — ${(e as Error).message}`);
         }
+      },
+    });
+
+    this.addCommand({
+      id: "show-diagnostics",
+      name: "Show diagnostics",
+      callback: () => {
+        const enabled = Array.from((this.app as any).plugins.enabledPlugins as Set<string>);
+        const integrations = ["dataview", "templater-obsidian", "omnisearch", "metadata-menu"]
+          .map((id) => `${id}: ${enabled.includes(id) ? "yes" : "no"}`);
+        new DiagnosticsModal(this.app, [
+          `Vault: ${this.app.vault.getName()}`,
+          `Socket: ${socketPath(this.slug)}`,
+          `Version: ${this.manifest.version}`,
+          ...integrations,
+        ]).open();
       },
     });
   }
