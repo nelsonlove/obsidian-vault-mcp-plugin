@@ -1,11 +1,12 @@
-import * as os from "node:os";
-import * as path from "node:path";
-import { Plugin, FileSystemAdapter, Notice, Modal } from "obsidian";
+import { Plugin, FileSystemAdapter, Modal } from "obsidian";
 import { UnixSocketServerTransport } from "./socket-transport.js";
 import { buildMcpServer } from "./mcp/server.js";
-import { vaultSlug, socketPath, bridgeDestPath } from "./paths.js";
+import { vaultSlug, socketPath } from "./paths.js";
 import { writeDiscovery, removeDiscovery, writeBridge, type Discovery } from "./discovery.js";
-import { wireUpClaudeConfig } from "./wire-up.js";
+import { ConnectionSetupModal, VaultMcpSettingTab } from "./connection-ui.js";
+
+interface VaultMcpSettings { setupAcknowledged: boolean; }
+const DEFAULT_SETTINGS: VaultMcpSettings = { setupAcknowledged: false };
 
 class DiagnosticsModal extends Modal {
   constructor(app: any, private readonly lines: string[]) { super(app); }
@@ -19,6 +20,10 @@ class DiagnosticsModal extends Modal {
 export default class VaultMcpPlugin extends Plugin {
   private transport: UnixSocketServerTransport | null = null;
   private slug = "";
+  declare settings: VaultMcpSettings;
+
+  async loadSettings() { this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData()); }
+  async saveSettings() { await this.saveData(this.settings); }
 
   async onload() {
     const vaultName = this.app.vault.getName();
@@ -54,19 +59,21 @@ export default class VaultMcpPlugin extends Plugin {
     writeDiscovery(this.slug, discovery);
     console.log(`[vault-mcp] listening on ${sock}`);
 
+    await this.loadSettings();
+    this.addSettingTab(new VaultMcpSettingTab(this.app, this));
+
     this.addCommand({
-      id: "wire-up-claude-code",
-      name: "Wire up Claude Code",
-      callback: () => {
-        try {
-          const configPath = path.join(os.homedir(), ".claude.json");
-          wireUpClaudeConfig({ bridgePath: bridgeDestPath(), vaultName: this.app.vault.getName(), configPath });
-          new Notice("vault-mcp: wrote mcpServers entry to ~/.claude.json. Restart your Claude Code session.");
-        } catch (e) {
-          new Notice(`vault-mcp: wire-up failed — ${(e as Error).message}`);
-        }
-      },
+      id: "connect-claude-code",
+      name: "Connect to Claude Code (show setup command)",
+      callback: () => new ConnectionSetupModal(this.app).open(),
     });
+
+    if (!this.settings.setupAcknowledged) {
+      new ConnectionSetupModal(this.app, async () => {
+        this.settings.setupAcknowledged = true;
+        await this.saveSettings();
+      }).open();
+    }
 
     this.addCommand({
       id: "show-diagnostics",
