@@ -1,5 +1,5 @@
 import { Plugin, FileSystemAdapter, Modal } from "obsidian";
-import { UnixSocketServerTransport } from "./socket-transport.js";
+import { UnixSocketListener } from "./socket-transport.js";
 import { buildMcpServer } from "./mcp/server.js";
 import { vaultSlug, socketPath } from "./paths.js";
 import { writeDiscovery, removeDiscovery, writeBridge, type Discovery } from "./discovery.js";
@@ -18,7 +18,7 @@ class DiagnosticsModal extends Modal {
 }
 
 export default class VaultMcpPlugin extends Plugin {
-  private transport: UnixSocketServerTransport | null = null;
+  private listener: UnixSocketListener | null = null;
   private slug = "";
   declare settings: VaultMcpSettings;
 
@@ -37,16 +37,20 @@ export default class VaultMcpPlugin extends Plugin {
     try { writeBridge(); }
     catch (e) { console.error("[vault-mcp] writeBridge failed", e); }
 
-    this.transport = new UnixSocketServerTransport(sock);
-    const server = buildMcpServer(this.app, {
+    const ctx = {
       pluginVersion: this.manifest.version,
       socketPath: sock,
       vaultName,
       enabledPlugins: () => Array.from((this.app as any).plugins.enabledPlugins as Set<string>),
-    });
+    };
 
-    await this.transport.listen();
-    await server.connect(this.transport);
+    // One MCP server per connection → concurrent Claude Code sessions and
+    // background agents share the plugin without evicting each other.
+    this.listener = new UnixSocketListener(sock, (transport) => {
+      const server = buildMcpServer(this.app, ctx);
+      server.connect(transport).catch((e) => console.error("[vault-mcp] connect failed", e));
+    });
+    await this.listener.listen();
 
     const discovery: Discovery = {
       socket_path: sock,
@@ -93,7 +97,7 @@ export default class VaultMcpPlugin extends Plugin {
   }
 
   async onunload() {
-    await this.transport?.close();
+    await this.listener?.close();
     removeDiscovery(this.slug);
   }
 }

@@ -4,50 +4,71 @@ import * as net from "node:net";
 import * as os from "node:os";
 import * as path from "node:path";
 import * as fs from "node:fs";
-import { UnixSocketServerTransport } from "../src/socket-transport.ts";
+import { UnixSocketListener } from "../src/socket-transport.ts";
+
+function tmpSock(tag) {
+  return path.join(os.tmpdir(), `vmcp-test-${tag}-${process.pid}.sock`);
+}
+
+// Wires each accepted connection to a transport that echoes a result for any
+// message it receives — mimics what main.ts does (one server per connection).
+function echoListener(sock, onReceived) {
+  return new UnixSocketListener(sock, (t) => {
+    t.onmessage = (m) => {
+      onReceived?.(m);
+      t.send({ jsonrpc: "2.0", id: m.id, result: { ok: true, who: m.params?.who } });
+    };
+    t.start();
+  });
+}
+
+function readOneMessage(client) {
+  return new Promise((resolve) => {
+    let buf = "";
+    client.setEncoding("utf8");
+    client.on("data", (d) => {
+      buf += d;
+      const nl = buf.indexOf("\n");
+      if (nl >= 0) resolve(JSON.parse(buf.slice(0, nl)));
+    });
+  });
+}
 
 test("frames JSON-RPC newline-delimited and round-trips", async () => {
-  const sock = path.join(os.tmpdir(), `vmcp-test-${process.pid}.sock`);
+  const sock = tmpSock("roundtrip");
   try { fs.unlinkSync(sock); } catch {}
-  const t = new UnixSocketServerTransport(sock);
   const received = [];
-  t.onmessage = (m) => {
-    received.push(m);
-    // echo a response back through the transport
-    t.send({ jsonrpc: "2.0", id: m.id, result: { ok: true } });
-  };
-  await t.listen();
+  const listener = echoListener(sock, (m) => received.push(m));
+  await listener.listen();
 
   const client = net.createConnection(sock);
   await new Promise((r) => client.once("connect", r));
-  const out = [];
-  client.setEncoding("utf8");
-  client.on("data", (d) => out.push(d));
+  const replyP = readOneMessage(client);
   client.write(JSON.stringify({ jsonrpc: "2.0", id: 1, method: "ping" }) + "\n");
+  const reply = await replyP;
 
-  await new Promise((r) => setTimeout(r, 100));
   assert.equal(received.length, 1);
   assert.equal(received[0].method, "ping");
-  assert.match(out.join(""), /"result":\{"ok":true\}/);
+  assert.deepEqual(reply.result, { ok: true });
 
   client.destroy();
-  await t.close();
-  try { fs.unlinkSync(sock); } catch { /* already gone */ }
+  await listener.close();
+  try { fs.unlinkSync(sock); } catch {}
 });
 
 test("two messages in one write are both delivered", async () => {
-  const sock = path.join(os.tmpdir(), `vmcp-test-framing1-${process.pid}.sock`);
+  const sock = tmpSock("framing1");
   try { fs.unlinkSync(sock); } catch {}
-  const t = new UnixSocketServerTransport(sock);
   const received = [];
-  t.onmessage = (m) => received.push(m);
-  await t.listen();
+  const listener = echoListener(sock, (m) => received.push(m));
+  await listener.listen();
 
   const client = net.createConnection(sock);
   await new Promise((r) => client.once("connect", r));
-  const m1 = { jsonrpc: "2.0", id: 1, method: "ping" };
-  const m2 = { jsonrpc: "2.0", id: 2, method: "pong" };
-  client.write(JSON.stringify(m1) + "\n" + JSON.stringify(m2) + "\n");
+  client.write(
+    JSON.stringify({ jsonrpc: "2.0", id: 1, method: "ping" }) + "\n" +
+    JSON.stringify({ jsonrpc: "2.0", id: 2, method: "pong" }) + "\n",
+  );
 
   await new Promise((r) => setTimeout(r, 100));
   assert.equal(received.length, 2);
@@ -55,22 +76,20 @@ test("two messages in one write are both delivered", async () => {
   assert.equal(received[1].method, "pong");
 
   client.destroy();
-  await t.close();
-  try { fs.unlinkSync(sock); } catch { /* already gone */ }
+  await listener.close();
+  try { fs.unlinkSync(sock); } catch {}
 });
 
 test("one message split across two writes is reassembled", async () => {
-  const sock = path.join(os.tmpdir(), `vmcp-test-framing2-${process.pid}.sock`);
+  const sock = tmpSock("framing2");
   try { fs.unlinkSync(sock); } catch {}
-  const t = new UnixSocketServerTransport(sock);
   const received = [];
-  t.onmessage = (m) => received.push(m);
-  await t.listen();
+  const listener = echoListener(sock, (m) => received.push(m));
+  await listener.listen();
 
   const client = net.createConnection(sock);
   await new Promise((r) => client.once("connect", r));
-  const msg = { jsonrpc: "2.0", id: 3, method: "split" };
-  const full = JSON.stringify(msg) + "\n";
+  const full = JSON.stringify({ jsonrpc: "2.0", id: 3, method: "split" }) + "\n";
   const mid = Math.floor(full.length / 2);
   client.write(full.slice(0, mid));
   await new Promise((r) => setTimeout(r, 20));
@@ -81,6 +100,35 @@ test("one message split across two writes is reassembled", async () => {
   assert.equal(received[0].method, "split");
 
   client.destroy();
-  await t.close();
-  try { fs.unlinkSync(sock); } catch { /* already gone */ }
+  await listener.close();
+  try { fs.unlinkSync(sock); } catch {}
+});
+
+test("serves multiple concurrent clients independently (no eviction)", async () => {
+  const sock = tmpSock("multiclient");
+  try { fs.unlinkSync(sock); } catch {}
+  const listener = echoListener(sock);
+  await listener.listen();
+
+  function pingAs(who, id) {
+    return new Promise((resolve) => {
+      const c = net.createConnection(sock);
+      c.once("connect", () => {
+        const replyP = readOneMessage(c);
+        c.write(JSON.stringify({ jsonrpc: "2.0", id, method: "ping", params: { who } }) + "\n");
+        replyP.then((reply) => { c.destroy(); resolve(reply); });
+      });
+    });
+  }
+
+  // Two clients connected at the same time. With the old single-client transport
+  // the second connection would destroy the first; here both must get replies.
+  const [a, b] = await Promise.all([pingAs("alice", 1), pingAs("bob", 2)]);
+  assert.equal(a.id, 1);
+  assert.equal(a.result.who, "alice");
+  assert.equal(b.id, 2);
+  assert.equal(b.result.who, "bob");
+
+  await listener.close();
+  try { fs.unlinkSync(sock); } catch {}
 });
