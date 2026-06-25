@@ -101,6 +101,8 @@ export function registerVaultWriteTools(server: McpServer, app: App) {
         if (!(file instanceof TFile)) return fail(new Error(`not found: ${p}`));
 
         if (op === "get") {
+          // Literal (case-sensitive) key, matching set/delete — mutation must
+          // target the exact YAML key, not a case-folded match, to avoid dupes.
           const fm = app.metadataCache.getFileCache(file)?.frontmatter;
           return ok({ path: p, key, op, value: fm ? fm[key] : undefined });
         }
@@ -185,9 +187,12 @@ export function registerVaultWriteTools(server: McpServer, app: App) {
           const ins = anchor_type === "heading" ? `\n\n${content}` : `${content}\n`;
           next = text.slice(0, start) + ins + text.slice(start);
         } else {
-          // append
+          // append at the end of the section/block body, preserving any blank
+          // line before a following heading (tail not starting with a newline)
           const head = text.slice(0, end).replace(/\n*$/, "\n");
-          next = head + content + "\n" + text.slice(end);
+          const tail = text.slice(end);
+          const sep = tail.length === 0 || tail.startsWith("\n") ? "\n" : "\n\n";
+          next = head + content + sep + tail;
         }
 
         await app.vault.modify(file, next);
@@ -217,7 +222,8 @@ export function registerVaultWriteTools(server: McpServer, app: App) {
         const dest = app.vault.getAbstractFileByPath(to);
         if (dest) {
           if (!overwrite) return fail(new Error(`destination exists (set overwrite=true): ${to}`));
-          if (dest instanceof TFile) await app.vault.delete(dest);
+          // Recoverable delete: if the subsequent rename fails, the overwritten note is in trash.
+          if (dest instanceof TFile) await app.vault.trash(dest, true);
         }
         await ensureParentFolders(app, to);
         await app.fileManager.renameFile(file, to);
