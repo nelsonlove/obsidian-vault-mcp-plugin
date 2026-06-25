@@ -1,7 +1,7 @@
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { type App, TFile } from "obsidian";
-import { ok, fail } from "./helpers.js";
+import { ok, fail, liveIndexStatus } from "./helpers.js";
 
 const RW = { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false };
 const DESTRUCTIVE = { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false };
@@ -225,9 +225,19 @@ export function registerVaultWriteTools(server: McpServer, app: App) {
           // Recoverable delete: if the subsequent rename fails, the overwritten note is in trash.
           if (dest instanceof TFile) await app.vault.trash(dest, true);
         }
+        // Count the backlinks Obsidian is about to rewrite (canonical, alias/embed-aware).
+        // getBacklinksForFile is not in the public type defs — cast required.
+        const bl = (app.metadataCache as { getBacklinksForFile?: (f: TFile) => { data?: Map<string, unknown[]> } })
+          .getBacklinksForFile?.(file);
+        let backlinks_files_touched = 0;
+        let backlinks_updated = 0;
+        if (bl?.data) {
+          backlinks_files_touched = bl.data.size;
+          for (const refs of bl.data.values()) backlinks_updated += Array.isArray(refs) ? refs.length : 0;
+        }
         await ensureParentFolders(app, to);
         await app.fileManager.renameFile(file, to);
-        return ok({ from, to, moved: true });
+        return ok({ from, to, backlinks_updated, backlinks_files_touched, index_status: liveIndexStatus(app) });
       } catch (e) { return fail(e); }
     }
   );
