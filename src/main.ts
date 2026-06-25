@@ -41,10 +41,13 @@ export default class VaultMcpPlugin extends Plugin {
     }
     if (!force && this.discoveryCount() > 1) { this.showFallbackOnce(); return; } // ambiguous: multiple vaults
     try {
-      if (force || !(await claudeIsRegistered(bin))) {
-        await claudeRegister(bin, bridgeDestPath());
-        new Notice("vault-mcp: connected to Claude Code. Restart any open Claude Code session to use it.");
+      if (await claudeIsRegistered(bin)) {
+        // `claude mcp add` errors on a duplicate name, so never re-add.
+        if (force) new Notice("vault-mcp: already connected to Claude Code.");
+        return;
       }
+      await claudeRegister(bin, bridgeDestPath());
+      new Notice("vault-mcp: connected to Claude Code. Restart any open Claude Code session to use it.");
     } catch (e) {
       new Notice(`vault-mcp: auto-register failed — ${(e as Error).message}. Use the manual command in settings.`);
       this.showFallbackOnce();
