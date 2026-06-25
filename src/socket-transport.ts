@@ -6,46 +6,26 @@ import type {
   TransportSendOptions,
 } from "@modelcontextprotocol/sdk/shared/transport.js";
 
-export class UnixSocketServerTransport implements Transport {
+/**
+ * SDK Transport for a SINGLE Unix-socket connection. Frames newline-delimited
+ * JSON-RPC. One of these is created per accepted connection, so concurrent
+ * MCP clients each get their own independent session.
+ */
+export class UnixSocketConnTransport implements Transport {
   onmessage?: (m: JSONRPCMessage) => void;
   onclose?: () => void;
   onerror?: (e: Error) => void;
 
-  private server: net.Server | null = null;
-  private conn: net.Socket | null = null;
   private buf = "";
+  private started = false;
 
-  constructor(private readonly socketPath: string) {}
+  constructor(private readonly conn: net.Socket) {}
 
-  // SDK Transport.start() — no-op; binding happens in listen().
-  async start(): Promise<void> {}
-
-  listen(): Promise<void> {
-    return new Promise((resolve, reject) => {
-      if (this.server) { reject(new Error("already listening")); return; }
-      try { fs.unlinkSync(this.socketPath); } catch { /* none */ }
-      this.server = net.createServer((conn) => this.attach(conn));
-      this.server.on("error", (e) => { this.onerror?.(e); reject(e); });
-      this.server.listen(this.socketPath, () => {
-        try {
-          fs.chmodSync(this.socketPath, 0o600);
-        } catch (e) {
-          this.onerror?.(e as Error);
-          reject(e);
-          return;
-        }
-        resolve();
-      });
-    });
-  }
-
-  private attach(conn: net.Socket) {
-    // Single-client model: replace any prior connection.
-    this.conn?.destroy();
-    this.conn = conn;
-    this.buf = "";
-    conn.setEncoding("utf8");
-    conn.on("data", (chunk: string) => {
+  async start(): Promise<void> {
+    if (this.started) return;
+    this.started = true;
+    this.conn.setEncoding("utf8");
+    this.conn.on("data", (chunk: string) => {
       this.buf += chunk;
       let nl: number;
       while ((nl = this.buf.indexOf("\n")) >= 0) {
@@ -59,19 +39,66 @@ export class UnixSocketServerTransport implements Transport {
         }
       }
     });
-    conn.on("close", () => { if (this.conn === conn) this.conn = null; });
-    conn.on("error", (e) => this.onerror?.(e));
+    this.conn.on("close", () => this.onclose?.());
+    this.conn.on("error", (e) => this.onerror?.(e));
   }
 
   async send(message: JSONRPCMessage, _options?: TransportSendOptions): Promise<void> {
-    if (!this.conn) return; // no client connected; drop (single-client model)
+    if (this.conn.destroyed) return; // peer gone; drop
     const data = JSON.stringify(message) + "\n";
-    await new Promise<void>((res, rej) => this.conn!.write(data, (err) => err ? rej(err) : res()));
+    await new Promise<void>((res, rej) => this.conn.write(data, (err) => (err ? rej(err) : res())));
   }
 
   async close(): Promise<void> {
-    this.conn?.destroy();
-    this.conn = null;
+    this.conn.destroy();
+  }
+}
+
+/**
+ * Listens on a Unix socket and hands each accepted connection to `onConnection`
+ * as its own transport. The caller wires a fresh MCP server per connection, so
+ * multiple Claude Code sessions (and background agents) can connect at once
+ * without evicting one another.
+ */
+export class UnixSocketListener {
+  private server: net.Server | null = null;
+
+  constructor(
+    private readonly socketPath: string,
+    private readonly onConnection: (transport: UnixSocketConnTransport) => void,
+  ) {}
+
+  listen(): Promise<void> {
+    return new Promise((resolve, reject) => {
+      if (this.server) {
+        reject(new Error("already listening"));
+        return;
+      }
+      try { fs.unlinkSync(this.socketPath); } catch { /* none */ }
+      const server = net.createServer((conn) => {
+        // Guard the window before the transport attaches its own error handler,
+        // so a connection error can't crash the whole socket server.
+        conn.on("error", () => { /* surfaced again via the transport once started */ });
+        this.onConnection(new UnixSocketConnTransport(conn));
+      });
+      this.server = server;
+      const onListenErr = (e: Error) => reject(e);
+      server.once("error", onListenErr);
+      server.listen(this.socketPath, () => {
+        server.off("error", onListenErr);
+        try {
+          fs.chmodSync(this.socketPath, 0o600);
+        } catch (e) {
+          reject(e as Error);
+          return;
+        }
+        server.on("error", (e) => console.error("[vault-mcp] socket server error", e));
+        resolve();
+      });
+    });
+  }
+
+  async close(): Promise<void> {
     await new Promise<void>((resolve) => {
       if (!this.server) return resolve();
       this.server.close(() => resolve());
@@ -79,6 +106,5 @@ export class UnixSocketServerTransport implements Transport {
     this.server = null;
     // Defensive cleanup: some platforms don't auto-remove the socket file.
     try { fs.unlinkSync(this.socketPath); } catch { /* already gone */ }
-    this.onclose?.();
   }
 }
