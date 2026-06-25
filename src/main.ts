@@ -1,9 +1,11 @@
-import { Plugin, FileSystemAdapter, Modal } from "obsidian";
+import { Plugin, FileSystemAdapter, Modal, Notice } from "obsidian";
+import * as fs from "node:fs";
 import { UnixSocketListener } from "./socket-transport.js";
 import { buildMcpServer } from "./mcp/server.js";
-import { vaultSlug, socketPath } from "./paths.js";
+import { vaultSlug, socketPath, stateDir, bridgeDestPath } from "./paths.js";
 import { writeDiscovery, removeDiscovery, writeBridge, type Discovery } from "./discovery.js";
 import { ConnectionSetupModal, VaultMcpSettingTab } from "./connection-ui.js";
+import { findClaudeBinary, claudeIsRegistered, claudeRegister, claudeRemove } from "./claude-cli.js";
 
 interface VaultMcpSettings { setupAcknowledged: boolean; }
 const DEFAULT_SETTINGS: VaultMcpSettings = { setupAcknowledged: false };
@@ -24,6 +26,42 @@ export default class VaultMcpPlugin extends Plugin {
 
   async loadSettings() { this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData()); }
   async saveSettings() { await this.saveData(this.settings); }
+
+  private discoveryCount(): number {
+    try { return fs.readdirSync(stateDir()).filter((f) => f.endsWith(".json")).length; }
+    catch { return 0; }
+  }
+
+  async autoRegister(force = false): Promise<void> {
+    const bin = findClaudeBinary();
+    if (!bin) {
+      if (force) new Notice("vault-mcp: `claude` CLI not found. Use the manual command in settings.");
+      else this.showFallbackOnce();
+      return;
+    }
+    if (!force && this.discoveryCount() > 1) { this.showFallbackOnce(); return; } // ambiguous: multiple vaults
+    try {
+      if (force || !(await claudeIsRegistered(bin))) {
+        await claudeRegister(bin, bridgeDestPath());
+        new Notice("vault-mcp: connected to Claude Code. Restart any open Claude Code session to use it.");
+      }
+    } catch (e) {
+      new Notice(`vault-mcp: auto-register failed — ${(e as Error).message}. Use the manual command in settings.`);
+      this.showFallbackOnce();
+    }
+  }
+
+  async claudeRemoveRegistration(): Promise<void> {
+    const bin = findClaudeBinary();
+    if (!bin) { new Notice("vault-mcp: `claude` CLI not found."); return; }
+    await claudeRemove(bin);
+    new Notice("vault-mcp: removed Claude Code registration.");
+  }
+
+  private showFallbackOnce(): void {
+    if (this.settings.setupAcknowledged) return;
+    new ConnectionSetupModal(this.app, async () => { this.settings.setupAcknowledged = true; await this.saveSettings(); }).open();
+  }
 
   async onload() {
     const vaultName = this.app.vault.getName();
@@ -68,16 +106,11 @@ export default class VaultMcpPlugin extends Plugin {
 
     this.addCommand({
       id: "connect-claude-code",
-      name: "Connect to Claude Code (show setup command)",
-      callback: () => new ConnectionSetupModal(this.app).open(),
+      name: "Connect to Claude Code",
+      callback: () => this.autoRegister(true),
     });
 
-    if (!this.settings.setupAcknowledged) {
-      new ConnectionSetupModal(this.app, async () => {
-        this.settings.setupAcknowledged = true;
-        await this.saveSettings();
-      }).open();
-    }
+    void this.autoRegister();
 
     this.addCommand({
       id: "show-diagnostics",
