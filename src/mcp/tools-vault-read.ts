@@ -1,7 +1,7 @@
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { type App, TFile, TFolder, getAllTags } from "obsidian";
-import { ok, fail, liveIndexStatus } from "./helpers.js";
+import { ok, fail } from "./helpers.js";
 
 const RO = { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false };
 
@@ -34,7 +34,7 @@ export function registerVaultReadTools(server: McpServer, app: App) {
       try {
         const f = app.vault.getAbstractFileByPath(p);
         if (!(f instanceof TFile)) return fail(new Error(`not found: ${p}`));
-        return ok({ path: p, content: await app.vault.read(f), index_status: liveIndexStatus(app) });
+        return ok({ path: p, content: await app.vault.read(f) });
       } catch (e) { return fail(e); }
     }
   );
@@ -62,7 +62,7 @@ export function registerVaultReadTools(server: McpServer, app: App) {
           errors.push({ path: p, error: e instanceof Error ? e.message : String(e) });
         }
       }
-      return ok({ count: notes.length, error_count: errors.length, notes, errors, index_status: liveIndexStatus(app) });
+      return ok({ count: notes.length, error_count: errors.length, notes, errors });
     }
   );
 
@@ -94,7 +94,6 @@ export function registerVaultReadTools(server: McpServer, app: App) {
           offset,
           notes: page.map((path) => ({ path })),
           has_more: offset + page.length < total,
-          index_status: liveIndexStatus(app),
         });
       } catch (e) { return fail(e); }
     }
@@ -147,7 +146,7 @@ export function registerVaultReadTools(server: McpServer, app: App) {
             if (notes.length >= limit) break;
           }
         }
-        return ok({ tag: normalizeTag(tag), count: notes.length, notes, index_status: liveIndexStatus(app) });
+        return ok({ tag: normalizeTag(tag), count: notes.length, notes });
       } catch (e) { return fail(e); }
     }
   );
@@ -179,7 +178,7 @@ export function registerVaultReadTools(server: McpServer, app: App) {
             }
           }
         }
-        return ok({ query, mode, count: hits.length, hits, index_status: liveIndexStatus(app) });
+        return ok({ query, mode, count: hits.length, hits });
       } catch (e) { return fail(e); }
     }
   );
@@ -205,7 +204,7 @@ export function registerVaultReadTools(server: McpServer, app: App) {
           const dest = linkpath ? app.metadataCache.getFirstLinkpathDest(linkpath, p) : null;
           return { ref: r.link, resolved_path: dest ? dest.path : undefined };
         });
-        return ok({ path: p, count: outlinks.length, outlinks, index_status: liveIndexStatus(app) });
+        return ok({ path: p, count: outlinks.length, outlinks });
       } catch (e) { return fail(e); }
     }
   );
@@ -248,7 +247,6 @@ export function registerVaultReadTools(server: McpServer, app: App) {
           count: matched.length,
           notes: matched,
           has_more: total > matched.length,
-          index_status: liveIndexStatus(app),
         });
       } catch (e) { return fail(e); }
     }
@@ -258,19 +256,10 @@ export function registerVaultReadTools(server: McpServer, app: App) {
     "obsidian_force_reindex",
     {
       title: "Force reindex (no-op)",
-      description: "Obsidian's metadata cache is always live, so there is nothing to rebuild — returns index stats immediately (duration_ms is 0). Read-only.",
+      description: "No-op: Obsidian's metadata cache is always live, so there is nothing to rebuild. Returns immediately. Read-only.",
       inputSchema: {},
       annotations: RO,
     },
-    async () => {
-      const count = app.vault.getMarkdownFiles().length;
-      return ok({
-        status: "ready",
-        prev_count: count,
-        count,
-        duration_ms: 0,
-        last_built_at: new Date().toISOString(),
-      });
-    }
+    async () => ok({ status: "live", message: "metadata cache is live; no reindex needed" })
   );
 }
