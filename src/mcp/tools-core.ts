@@ -2,12 +2,14 @@ import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { App, TFile } from "obsidian";
 import { ok, fail } from "./helpers.js";
+import type { GuardSettings } from "../guard.js";
 
 export interface ServerCtx {
   pluginVersion: string;
   socketPath: string;
   vaultName: string;
   enabledPlugins: () => string[];
+  getSettings: () => GuardSettings;
 }
 
 const RO = { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false };
