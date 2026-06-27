@@ -234,37 +234,26 @@ export function registerIntegrationTools(server: McpServer, app: App, ctx: Serve
       },
       async ({ fileclass }) => {
         try {
-          // Metadata Menu exposes field data via plugin.fieldIndex.
-          // fileClassesFields is a Map<string, Field[]> keyed by fileClass name.
-          // Each Field has at minimum: name (string), type (string), options (object?).
-          // FLAG: verify fieldIndex.fileClassesFields key type (name string vs fileClass object)
-          // and Field shape (name/type/options) during live verification with Metadata Menu.
+          // Metadata Menu exposes field data via plugin.fieldIndex.fileClassesFields,
+          // a Map<string, Field[]>. Verified live (2026-06-26): keys are the
+          // fileClass note's *full vault path without extension*, e.g.
+          // "D20-29 People/D26 Divorce/PleadingsEntry" — NOT the bare name. Match the
+          // requested name against the basename (last path segment), or an exact key.
           const mm = (app as any).plugins?.plugins?.["metadata-menu"];
           if (!mm) return fail(new Error("metadata-menu plugin not available"));
 
           const fieldIndex = mm.fieldIndex;
-          if (!fieldIndex) return fail(new Error("metadata-menu: fieldIndex not available"));
+          const fcf: Map<string, unknown[]> | undefined = fieldIndex?.fileClassesFields;
+          if (!(fcf instanceof Map)) return fail(new Error("metadata-menu: fileClassesFields not available"));
 
-          // Try fileClassesFields map first (documented in MM source as Map<string, Field[]>)
-          let rawFields: unknown[] | undefined;
-          if (fieldIndex.fileClassesFields instanceof Map) {
-            rawFields = fieldIndex.fileClassesFields.get(fileclass);
+          const key = [...fcf.keys()].find(
+            (k) => k === fileclass || k.split("/").pop() === fileclass,
+          );
+          if (!key) {
+            const available = [...fcf.keys()].map((k) => k.split("/").pop());
+            return fail(new Error(`fileClass not found: ${fileclass}. Available: ${available.join(", ")}`));
           }
-          // Fallback: try fileClassesAncestors for the class definition
-          if (!rawFields && fieldIndex.fileClassesAncestors instanceof Map) {
-            // fileClassesAncestors maps fileClass name to ancestor chain; try getting
-            // fields from each ancestor's fileClass object
-            const ancestors: unknown[] = fieldIndex.fileClassesAncestors.get(fileclass) ?? [];
-            if (ancestors.length > 0) {
-              // The primary class is the first entry; check if it has a .fields property
-              const primary = ancestors[0] as any;
-              rawFields = primary?.fields ? Object.values(primary.fields) : undefined;
-            }
-          }
-
-          if (!rawFields) {
-            return fail(new Error(`fileClass not found: ${fileclass}`));
-          }
+          const rawFields = fcf.get(key) ?? [];
 
           const fields = rawFields.map((f: any) => ({
             name: String(f.name ?? f.id ?? ""),
@@ -272,7 +261,7 @@ export function registerIntegrationTools(server: McpServer, app: App, ctx: Serve
             options: f.options ?? undefined,
           }));
 
-          return ok({ fileclass, fields });
+          return ok({ fileclass, fileclass_key: key, fields });
         } catch (e) { return fail(e); }
       }
     );
