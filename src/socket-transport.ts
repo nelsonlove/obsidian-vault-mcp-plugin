@@ -62,6 +62,7 @@ export class UnixSocketConnTransport implements Transport {
  */
 export class UnixSocketListener {
   private server: net.Server | null = null;
+  private conns = new Set<net.Socket>();
 
   constructor(
     private readonly socketPath: string,
@@ -76,6 +77,10 @@ export class UnixSocketListener {
       }
       try { fs.unlinkSync(this.socketPath); } catch { /* none */ }
       const server = net.createServer((conn) => {
+        // Track live connections so close() can drain them; net.Server.close()
+        // alone waits for open sockets to end on their own (hangs on unload).
+        this.conns.add(conn);
+        conn.on("close", () => this.conns.delete(conn));
         // Guard the window before the transport attaches its own error handler,
         // so a connection error can't crash the whole socket server.
         conn.on("error", () => { /* surfaced again via the transport once started */ });
@@ -89,6 +94,12 @@ export class UnixSocketListener {
         try {
           fs.chmodSync(this.socketPath, 0o600);
         } catch (e) {
+          // The socket file's permissions are the only auth boundary — never
+          // stay listening world-readable. Stop the server, remove the
+          // wrong-perms socket file, then reject.
+          server.close();
+          this.server = null;
+          try { fs.unlinkSync(this.socketPath); } catch { /* none */ }
           reject(e as Error);
           return;
         }
@@ -99,6 +110,10 @@ export class UnixSocketListener {
   }
 
   async close(): Promise<void> {
+    // Destroy live connections first so server.close() resolves promptly
+    // instead of waiting for each peer to disconnect on its own.
+    for (const conn of this.conns) conn.destroy();
+    this.conns.clear();
     await new Promise<void>((resolve) => {
       if (!this.server) return resolve();
       this.server.close(() => resolve());
