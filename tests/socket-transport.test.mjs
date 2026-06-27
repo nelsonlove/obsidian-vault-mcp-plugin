@@ -132,3 +132,25 @@ test("serves multiple concurrent clients independently (no eviction)", async () 
   await listener.close();
   try { fs.unlinkSync(sock); } catch {}
 });
+
+test("close() drains a live connection and resolves promptly (no unload hang)", async () => {
+  const sock = tmpSock("drain");
+  try { fs.unlinkSync(sock); } catch {}
+  const listener = echoListener(sock);
+  await listener.listen();
+
+  // A client stays connected (does not disconnect on its own).
+  const client = net.createConnection(sock);
+  await new Promise((r) => client.once("connect", r));
+
+  // net.Server.close() alone would wait for this peer to end → hang. The
+  // drain in close() must destroy it so close() resolves within the timeout.
+  const closed = await Promise.race([
+    listener.close().then(() => "closed"),
+    new Promise((r) => setTimeout(() => r("timeout"), 2000)),
+  ]);
+  assert.equal(closed, "closed", "listener.close() hung with a live connection");
+
+  client.destroy();
+  try { fs.unlinkSync(sock); } catch {}
+});
