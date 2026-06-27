@@ -1,6 +1,6 @@
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import type { App } from "obsidian";
+import { type App, TFile } from "obsidian";
 import { ok, fail } from "./helpers.js";
 import type { ServerCtx } from "./tools-core.js";
 
@@ -147,7 +147,6 @@ export function registerIntegrationTools(server: McpServer, app: App, _ctx: Serv
           if (!templater) return fail(new Error("templater api not available"));
 
           // Resolve template file
-          const { TFile } = await import("obsidian");
           const templateFile = app.vault.getAbstractFileByPath(template_path);
           if (!(templateFile instanceof TFile)) {
             return fail(new Error(`template not found: ${template_path}`));
