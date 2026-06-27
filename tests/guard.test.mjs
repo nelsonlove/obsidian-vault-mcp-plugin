@@ -63,3 +63,21 @@ test("empty allowlist allows all paths", () => {
   });
   assert.equal(result, null);
 });
+
+test("allowlist blocks a '..' traversal that resolves outside the allowed prefix", () => {
+  const result = guardCall({
+    isMutating: false,
+    args: { path: "20-29 People/../00-09 System/secret.md" },
+    settings: { readOnly: false, allowlist: ["20-29 People"] },
+  });
+  assert.equal(result?.code, "out_of_allowlist");
+});
+
+test("allowlist allows a '..' that stays within the prefix after normalization", () => {
+  const result = guardCall({
+    isMutating: false,
+    args: { path: "20-29 People/26 Divorce/../26 Divorce/note.md" },
+    settings: { readOnly: false, allowlist: ["20-29 People"] },
+  });
+  assert.equal(result, null);
+});

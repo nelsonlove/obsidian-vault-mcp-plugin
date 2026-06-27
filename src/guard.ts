@@ -1,3 +1,5 @@
+import { posix } from "node:path";
+
 export interface GuardSettings { readOnly: boolean; allowlist: string[]; }
 
 // Path-bearing argument keys across the tool surface.
@@ -25,9 +27,14 @@ export function guardCall(opts: {
   }
   if (settings.allowlist.length) {
     const norm = settings.allowlist.map((p) => p.replace(/\/+$/, "")).filter(Boolean);
-    for (const p of collectPaths(args)) {
-      const allowed = norm.some((prefix) => p === prefix || p.startsWith(prefix + "/"));
-      if (!allowed) return { code: "out_of_allowlist", message: `path '${p}' is outside the vault-mcp allowlist` };
+    for (const raw of collectPaths(args)) {
+      // Normalize first: collapse "." / ".." so a path like
+      // "20-29 People/../00-09 System/x.md" can't pass the prefix check and
+      // then resolve elsewhere inside Obsidian (allowlist traversal bypass).
+      const p = posix.normalize(raw);
+      const allowed =
+        !p.startsWith("..") && norm.some((prefix) => p === prefix || p.startsWith(prefix + "/"));
+      if (!allowed) return { code: "out_of_allowlist", message: `path '${raw}' is outside the vault-mcp allowlist` };
     }
   }
   return null;
