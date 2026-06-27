@@ -31,12 +31,16 @@ function serializeDvValue(v: unknown): unknown {
   return v;
 }
 
-export function registerIntegrationTools(server: McpServer, app: App, ctx: ServerCtx) {
+export function registerIntegrationTools(server: McpServer, app: App, _ctx: ServerCtx) {
 
-  const enabled = new Set(ctx.enabledPlugins());
+  // Gate on the actually-LOADED plugin instance, not app.plugins.enabledPlugins:
+  // enabledPlugins can list a plugin that is configured-enabled but uninstalled
+  // (a stale entry), in which case its instance is absent and the tool can't work.
+  // Checking app.plugins.plugins[id] means a tool only registers when usable.
+  const loaded = (id: string): boolean => !!(app as any).plugins?.plugins?.[id];
 
   // ── Dataview tools ────────────────────────────────────────────────────────────
-  if (enabled.has("dataview")) {
+  if (loaded("dataview")) {
 
     // ── obsidian_dataview_list_query ──────────────────────────────────────────
     server.registerTool(
@@ -114,7 +118,7 @@ export function registerIntegrationTools(server: McpServer, app: App, ctx: Serve
   }
 
   // ── Templater tool ────────────────────────────────────────────────────────────
-  if (enabled.has("templater-obsidian")) {
+  if (loaded("templater-obsidian")) {
 
     // ── obsidian_create_note_from_template ────────────────────────────────────
     server.registerTool(
@@ -182,7 +186,7 @@ export function registerIntegrationTools(server: McpServer, app: App, ctx: Serve
   }
 
   // ── Omnisearch tool ───────────────────────────────────────────────────────────
-  if (enabled.has("omnisearch")) {
+  if (loaded("omnisearch")) {
 
     // ── obsidian_omnisearch ───────────────────────────────────────────────────
     server.registerTool(
@@ -218,7 +222,7 @@ export function registerIntegrationTools(server: McpServer, app: App, ctx: Serve
   }
 
   // ── Metadata Menu tools ───────────────────────────────────────────────────────
-  if (enabled.has("metadata-menu")) {
+  if (loaded("metadata-menu")) {
 
     // ── obsidian_fileclass_schema ─────────────────────────────────────────────
     server.registerTool(
