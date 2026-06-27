@@ -33,6 +33,30 @@ function serializeDvValue(v: unknown): unknown {
   return v;
 }
 
+// Total: out-of-range / surrogate code points (never in real Omnisearch output,
+// but the excerpt is external plugin text) yield "" instead of throwing.
+function codePoint(n: number): string {
+  try { return String.fromCodePoint(n); } catch { return ""; }
+}
+
+// Omnisearch excerpts are HTML for its own UI: matched terms wrapped in <mark>
+// and special chars entity-escaped (e.g. &#039;). Decode to plain text for MCP.
+function decodeExcerpt(s: string): string {
+  return s
+    .replace(/<!--[\s\S]*?(?:-->|$)/g, " ") // drop HTML comments (incl. truncated ones at snippet end)
+    .replace(/<br\s*\/?>/gi, " ")        // line breaks → space
+    .replace(/<\/?[a-z][^>]*>/gi, "")    // strip <mark> and any other HTML tags
+    .replace(/&#x([0-9a-f]+);/gi, (_, h) => codePoint(parseInt(h, 16)))
+    .replace(/&#(\d+);/g, (_, d) => codePoint(parseInt(d, 10)))
+    .replace(/&quot;/g, '"')
+    .replace(/&apos;/g, "'")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&amp;/g, "&")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
 export function registerIntegrationTools(server: McpServer, app: App, _ctx: ServerCtx) {
 
   // Gate on the actually-LOADED plugin instance, not app.plugins.enabledPlugins:
@@ -217,7 +241,7 @@ export function registerIntegrationTools(server: McpServer, app: App, _ctx: Serv
           const hits = results.map((r) => ({
             path: r.path,
             score: r.score ?? null,
-            excerpt: r.excerpt ?? null,
+            excerpt: r.excerpt ? decodeExcerpt(r.excerpt) : null,
           }));
           return ok({ query, hits });
         } catch (e) { return fail(e); }
