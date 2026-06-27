@@ -13,15 +13,17 @@ const RW = { readOnlyHint: false, destructiveHint: false, idempotentHint: false,
 function serializeDvValue(v: unknown): unknown {
   if (v === null || v === undefined) return v;
   if (typeof v === "object") {
-    // Dataview Link: { path: string, display?: string, embed?: boolean }
-    if ("path" in v && typeof (v as any).path === "string" && !Array.isArray(v)) {
-      const link = v as { path: string; display?: string };
-      return link.display ? `[[${link.path}|${link.display}]]` : `[[${link.path}]]`;
-    }
+    // Arrays (incl. Dataview DataArrays) first — before the Link test, since a
+    // DataArray could carry a `.path` property and must not be mistaken for a Link.
     if (Array.isArray(v)) {
       return v.map(serializeDvValue);
     }
-    // Dates: Dataview uses Luxon DateTime objects — serialize to ISO string if available
+    // Dataview Link: { path: string, display?: string, embed?: boolean }
+    if ("path" in v && typeof (v as any).path === "string") {
+      const link = v as { path: string; display?: string };
+      return link.display ? `[[${link.path}|${link.display}]]` : `[[${link.path}]]`;
+    }
+    // Dates/Durations: Dataview uses Luxon objects — serialize to ISO if available
     if (typeof (v as any).toISO === "function") {
       return (v as any).toISO();
     }
@@ -158,12 +160,15 @@ export function registerIntegrationTools(server: McpServer, app: App, _ctx: Serv
           // Strip .md suffix for Templater's filename arg (it appends .md itself)
           const filenameStem = filename.endsWith(".md") ? filename.slice(0, -3) : filename;
 
-          // Resolve destination folder — create if absent
-          let destFolder = app.vault.getAbstractFileByPath(folder === "/" ? "" : folder);
-          if (!destFolder) {
-            await app.vault.createFolder(folder);
-            destFolder = app.vault.getAbstractFileByPath(folder);
+          // Resolve destination folder — create non-root folders if absent.
+          const folderPath = folder === "/" ? "" : folder;
+          let destFolder = app.vault.getAbstractFileByPath(folderPath);
+          if (!destFolder && folderPath !== "") {
+            await app.vault.createFolder(folderPath);
+            destFolder = app.vault.getAbstractFileByPath(folderPath);
           }
+          if (!destFolder) destFolder = app.vault.getRoot();
+          if (!destFolder) return fail(new Error(`could not resolve destination folder: ${folder}`));
 
           // create_new_note_from_template(template_file, folder, filename, open_new_note)
           // Returns a TFile of the created note.
@@ -250,11 +255,15 @@ export function registerIntegrationTools(server: McpServer, app: App, _ctx: Serv
           const fcf: Map<string, unknown[]> | undefined = fieldIndex?.fileClassesFields;
           if (!(fcf instanceof Map)) return fail(new Error("metadata-menu: fileClassesFields not available"));
 
-          const key = [...fcf.keys()].find(
-            (k) => k === fileclass || k.split("/").pop() === fileclass,
-          );
+          const keys = [...fcf.keys()];
+          const exact = keys.find((k) => k === fileclass);
+          const byBasename = keys.filter((k) => k.split("/").pop() === fileclass);
+          const key = exact ?? (byBasename.length === 1 ? byBasename[0] : undefined);
           if (!key) {
-            const available = [...fcf.keys()].map((k) => k.split("/").pop());
+            if (byBasename.length > 1) {
+              return fail(new Error(`ambiguous fileClass '${fileclass}'; matches multiple — pass a full key: ${byBasename.join(", ")}`));
+            }
+            const available = keys.map((k) => k.split("/").pop());
             return fail(new Error(`fileClass not found: ${fileclass}. Available: ${available.join(", ")}`));
           }
           const rawFields = fcf.get(key) ?? [];
@@ -290,15 +299,15 @@ export function registerIntegrationTools(server: McpServer, app: App, _ctx: Serv
           // Open the note first so file-scoped commands have a target.
           await app.workspace.openLinkText(p, "", false);
 
-          // Execute MM's insert-missing-fields command.
-          // FLAG: verify exact command ID — known candidates:
-          //   "metadata-menu:insert_missing_fields"
-          //   "metadata-menu:fields-modal"
-          // Use executeCommandById; app.commands is internal — cast required.
+          // Execute MM's insert-missing-fields command (id verified live 2026-06-26).
+          // app.commands is internal — cast required.
           const commandId = "metadata-menu:insert_missing_fields";
           const executed = (app as any).commands?.executeCommandById(commandId) as boolean | undefined;
-          if (executed === false) {
-            return fail(new Error(`command not found or returned false: ${commandId}`));
+          // executeCommandById returns false when the command id is unknown, and
+          // the whole expression is undefined if app.commands itself is absent —
+          // treat both as failure (don't claim success when nothing ran).
+          if (!executed) {
+            return fail(new Error(`command not found or did not run: ${commandId}`));
           }
 
           return ok({ path: p, inserted: true });
