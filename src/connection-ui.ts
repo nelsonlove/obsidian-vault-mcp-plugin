@@ -77,5 +77,48 @@ export class VaultMcpSettingTab extends PluginSettingTab {
     new Setting(containerEl)
       .addButton((b) => b.setButtonText("Copy command").setCta().onClick(() => copyToClipboard(cmd)))
       .addButton((b) => b.setButtonText("Open setup popup").onClick(() => new ConnectionSetupModal(this.app).open()));
+
+    // Security settings.
+    containerEl.createEl("h3", { text: "Security" });
+
+    new Setting(containerEl)
+      .setName("Read-only mode")
+      .setDesc("Block all mutating tools (write, move, delete, patch, etc.). Read and search tools remain available.")
+      .addToggle((t) =>
+        t.setValue(this.plugin.settings.readOnly).onChange(async (value) => {
+          this.plugin.settings.readOnly = value;
+          await this.plugin.saveSettings();
+        })
+      );
+
+    new Setting(containerEl)
+      .setName("Path allowlist")
+      .setDesc("Restrict file operations to these vault-relative prefixes (one per line). Leave empty to allow the whole vault.")
+      .addTextArea((ta) => {
+        ta.setValue(this.plugin.settings.allowlist.join("\n"));
+        ta.inputEl.rows = 5;
+        ta.inputEl.style.width = "100%";
+        ta.onChange(async (value) => {
+          this.plugin.settings.allowlist = value.split("\n").map((s) => s.trim()).filter(Boolean);
+          await this.plugin.saveSettings();
+        });
+      });
+
+    new Setting(containerEl)
+      .setName("Socket enabled")
+      .setDesc(
+        this.plugin.settings.enabled
+          ? "The MCP socket is enabled. Toggle to disable (reload required)."
+          : "The MCP socket is disabled. Toggle to re-enable (reload required)."
+      )
+      .addButton((b) => {
+        b.setButtonText(this.plugin.settings.enabled ? "Disable socket" : "Enable socket");
+        b.onClick(async () => {
+          this.plugin.settings.enabled = !this.plugin.settings.enabled;
+          await this.plugin.saveSettings();
+          new Notice("vault-mcp: reload the plugin (or restart Obsidian) for this change to take effect.");
+          this.display();
+        });
+      });
   }
 }

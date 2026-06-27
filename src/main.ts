@@ -7,8 +7,8 @@ import { writeDiscovery, removeDiscovery, writeBridge, type Discovery } from "./
 import { ConnectionSetupModal, VaultMcpSettingTab } from "./connection-ui.js";
 import { findClaudeBinary, claudeIsRegistered, claudeRegister, claudeRemove } from "./claude-cli.js";
 
-interface VaultMcpSettings { setupAcknowledged: boolean; }
-const DEFAULT_SETTINGS: VaultMcpSettings = { setupAcknowledged: false };
+interface VaultMcpSettings { setupAcknowledged: boolean; readOnly: boolean; allowlist: string[]; enabled: boolean; }
+const DEFAULT_SETTINGS: VaultMcpSettings = { setupAcknowledged: false, readOnly: false, allowlist: [], enabled: true };
 
 class DiagnosticsModal extends Modal {
   constructor(app: any, private readonly lines: string[]) { super(app); }
@@ -67,6 +67,9 @@ export default class VaultMcpPlugin extends Plugin {
   }
 
   async onload() {
+    // Load settings FIRST so the enabled gate and guard settings are available.
+    await this.loadSettings();
+
     const vaultName = this.app.vault.getName();
     this.slug = vaultSlug(vaultName);
     const sock = socketPath(this.slug);
@@ -83,28 +86,32 @@ export default class VaultMcpPlugin extends Plugin {
       socketPath: sock,
       vaultName,
       enabledPlugins: () => Array.from((this.app as any).plugins.enabledPlugins as Set<string>),
+      getSettings: () => ({ readOnly: this.settings.readOnly, allowlist: this.settings.allowlist }),
     };
 
-    // One MCP server per connection → concurrent Claude Code sessions and
-    // background agents share the plugin without evicting each other.
-    this.listener = new UnixSocketListener(sock, (transport) => {
-      const server = buildMcpServer(this.app, ctx);
-      server.connect(transport).catch((e) => console.error("[vault-mcp] connect failed", e));
-    });
-    await this.listener.listen();
+    if (this.settings.enabled) {
+      // One MCP server per connection → concurrent Claude Code sessions and
+      // background agents share the plugin without evicting each other.
+      this.listener = new UnixSocketListener(sock, (transport) => {
+        const server = buildMcpServer(this.app, ctx);
+        server.connect(transport).catch((e) => console.error("[vault-mcp] connect failed", e));
+      });
+      await this.listener.listen();
 
-    const discovery: Discovery = {
-      socket_path: sock,
-      vault_path: basePath,
-      vault_name: vaultName,
-      plugin_version: this.manifest.version,
-      obsidian_version: (this.app as any).appVersion ?? "",
-      started_at: new Date().toISOString(),
-    };
-    writeDiscovery(this.slug, discovery);
-    console.log(`[vault-mcp] listening on ${sock}`);
+      const discovery: Discovery = {
+        socket_path: sock,
+        vault_path: basePath,
+        vault_name: vaultName,
+        plugin_version: this.manifest.version,
+        obsidian_version: (this.app as any).appVersion ?? "",
+        started_at: new Date().toISOString(),
+      };
+      writeDiscovery(this.slug, discovery);
+      console.log(`[vault-mcp] listening on ${sock}`);
+    } else {
+      console.log("[vault-mcp] disabled in settings; socket not started");
+    }
 
-    await this.loadSettings();
     this.addSettingTab(new VaultMcpSettingTab(this.app, this));
 
     this.addCommand({

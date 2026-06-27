@@ -48,6 +48,19 @@ function flattenBookmarks(items: BookmarkItem[]): Array<{ title: string; type: s
   return result;
 }
 
+/** Find the raw bookmark item by display title (recurses into groups). */
+function findRawBookmark(items: BookmarkItem[], title: string): BookmarkItem | undefined {
+  for (const item of items) {
+    if (item.type === "group" && item.items) {
+      const found = findRawBookmark(item.items, title);
+      if (found) return found;
+    } else if ((item.title ?? item.path ?? "") === title) {
+      return item;
+    }
+  }
+  return undefined;
+}
+
 export function registerNavTools(server: McpServer, app: App) {
 
   // ── obsidian_jump_to ────────────────────────────────────────────────────────
@@ -284,7 +297,7 @@ export function registerNavTools(server: McpServer, app: App) {
     "obsidian_open_bookmark",
     {
       title: "Open a bookmark",
-      description: "Open a bookmarked file by its title (requires the core Bookmarks plugin). Returns {name, opened:true}.",
+      description: "Open a bookmark by its title — any type (file, folder, search, graph, group). Requires the core Bookmarks plugin. Returns {name, type, opened:true}.",
       inputSchema: {
         name: z.string().min(1).describe("Bookmark title (exact match)."),
       },
@@ -297,13 +310,13 @@ export function registerNavTools(server: McpServer, app: App) {
 
         // instance.items holds the bookmark tree — internal, not in public types.
         const items: BookmarkItem[] = (instance as any).items ?? [];
-        const flat = flattenBookmarks(items);
-        const bm = flat.find((b) => b.title === name);
+        const bm = findRawBookmark(items, name);
         if (!bm) return fail(new Error(`bookmark not found: ${name}`));
-        if (!bm.path) return fail(new Error(`bookmark '${name}' has no file path (not a file bookmark)`));
 
-        await app.workspace.openLinkText(bm.path, "", false);
-        return ok({ name, opened: true });
+        // Delegate to the Bookmarks plugin's own opener, which handles every
+        // bookmark type (file/folder/search/graph/group) — not just files.
+        await (instance as any).openBookmark(bm, "tab");
+        return ok({ name, type: bm.type, opened: true });
       } catch (e) { return fail(e); }
     }
   );
