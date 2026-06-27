@@ -348,6 +348,11 @@ export function registerNavTools(server: McpServer, app: App) {
     },
     async ({ plugin_id, enabled }) => {
       try {
+        // Don't let the MCP disable its own host plugin — it would tear down
+        // this connection mid-response. Use Obsidian's settings to disable.
+        if (!enabled && plugin_id === "vault-mcp") {
+          return fail(new Error("refusing to disable vault-mcp via MCP (it hosts this connection); use Obsidian settings"));
+        }
         // app.plugins.enablePlugin / disablePlugin are internal — not in public obsidian types.
         const plugins = (app as any).plugins;
         if (!plugins) return fail(new Error("community plugins manager not available"));

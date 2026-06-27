@@ -52,13 +52,12 @@ export function registerComplementaryTools(server: McpServer, app: App, ctx: Ser
         const cache = app.metadataCache.getFileCache(file);
         const content = await app.vault.read(file);
 
-        // Strip the frontmatter block from body if present.
-        let body = content;
-        if (cache?.frontmatterPosition) {
-          // frontmatterPosition.end.offset points to the closing ---; slice past it.
-          const fmEnd = cache.frontmatterPosition.end.offset;
-          body = content.slice(fmEnd).replace(/^\n/, "");
-        }
+        // Strip a leading YAML frontmatter block. Regex-based so it doesn't
+        // depend on the exact inclusive/exclusive semantics of the cache's
+        // frontmatterPosition.end.offset (which differs across versions).
+        const body = cache?.frontmatter
+          ? content.replace(/^---\r?\n[\s\S]*?\r?\n---\r?\n?/, "")
+          : content;
 
         return ok({
           path: p,
