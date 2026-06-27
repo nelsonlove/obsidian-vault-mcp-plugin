@@ -95,9 +95,11 @@ export class UnixSocketListener {
           fs.chmodSync(this.socketPath, 0o600);
         } catch (e) {
           // The socket file's permissions are the only auth boundary — never
-          // stay listening world-readable. Stop the server before rejecting.
+          // stay listening world-readable. Stop the server, remove the
+          // wrong-perms socket file, then reject.
           server.close();
           this.server = null;
+          try { fs.unlinkSync(this.socketPath); } catch { /* none */ }
           reject(e as Error);
           return;
         }
