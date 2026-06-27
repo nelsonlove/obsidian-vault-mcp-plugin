@@ -125,7 +125,6 @@ export function registerComplementaryTools(server: McpServer, app: App, ctx: Ser
 
         const text = await app.vault.read(file);
         const h = headings[idx];
-        const sectionBodyStart = h.position.end.offset; // just after the heading line
         let sectionEnd = text.length;
         for (let j = idx + 1; j < headings.length; j++) {
           if (headings[j].level <= h.level) {
