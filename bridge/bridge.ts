@@ -49,6 +49,30 @@ export function filterLive(
   });
 }
 
+// --- Actionable diagnostics (pure, so they can be unit-tested) ---
+
+export function noLiveMessage(all: Discovery[]): string {
+  return all.length > 0
+    ? `vault-mcp: found vault discovery but no live socket — the 'Vault MCP' plugin is ` +
+        `disabled or Obsidian is closed.\n  Fix: ${ENABLE_HINT}.\n` +
+        `  (stale discovery for: ${all.map((d) => d.vault_name).join(", ")})`
+    : `vault-mcp: no vault is currently serving MCP — ${ENABLE_HINT}.`;
+}
+
+export function staleRequestedMessage(pick: string): string {
+  return (
+    `vault-mcp: vault '${pick}' has a discovery but no live socket — the 'Vault MCP' ` +
+    `plugin is disabled or Obsidian isn't running.\n  Fix: ${ENABLE_HINT}.`
+  );
+}
+
+export function connectFailMessage(chosen: Discovery): string {
+  return (
+    `vault-mcp: can't connect to vault '${chosen.vault_name}' — the 'Vault MCP' plugin ` +
+    `is disabled or Obsidian isn't running.\n  Fix: ${ENABLE_HINT}.\n  (socket: ${chosen.socket_path})`
+  );
+}
+
 function loadDiscoveries(): Discovery[] {
   const dir = path.join(os.homedir(), ".claude", "vault-mcp");
   let files: string[] = [];
@@ -73,8 +97,14 @@ function parseFlag(argv: string[], name: string): string | undefined {
   return i >= 0 && i + 1 < argv.length ? argv[i + 1] : undefined;
 }
 
+// Synchronous write to fd 2 so the message flushes before exit even when stderr
+// is a POSIX pipe (as it is when Claude Code spawns the bridge as an MCP server).
 function fail(msg: string): never {
-  process.stderr.write(`${msg}\n`);
+  try {
+    fs.writeSync(2, `${msg}\n`);
+  } catch {
+    /* ignore */
+  }
   process.exit(1);
 }
 
@@ -83,21 +113,13 @@ if (process.argv[1] && process.argv[1].endsWith("bridge.mjs")) {
   try {
     const all = loadDiscoveries();
     const live = filterLive(all);
-    // Nothing live to connect to: distinguish "stale discovery" (plugin disabled /
-    // Obsidian closed) from "no discovery at all" (plugin never ran).
-    if (live.length === 0) {
-      fail(
-        all.length > 0
-          ? `vault-mcp: found vault discovery but no live socket — the 'Vault MCP' ` +
-              `plugin is disabled or Obsidian is closed.\n  Fix: ${ENABLE_HINT}.\n` +
-              `  (stale discovery for: ${all.map((d) => d.vault_name).join(", ")})`
-          : `vault-mcp: no vault is currently serving MCP — ${ENABLE_HINT}.`
-      );
+    if (live.length === 0) fail(noLiveMessage(all));
+    const pick = parseFlag(process.argv, "vault") ?? process.env.VAULT_MCP_VAULT;
+    // Requested a specific vault that has a (stale) discovery but isn't live.
+    if (pick && !live.some((d) => d.vault_name === pick) && all.some((d) => d.vault_name === pick)) {
+      fail(staleRequestedMessage(pick));
     }
-    const chosen = selectVault(live, {
-      flag: parseFlag(process.argv, "vault"),
-      env: process.env.VAULT_MCP_VAULT,
-    });
+    const chosen = selectVault(live, { flag: pick });
     const sock = net.createConnection(chosen.socket_path);
     sock.on("connect", () => {
       process.stdin.pipe(sock);
@@ -105,13 +127,7 @@ if (process.argv[1] && process.argv[1].endsWith("bridge.mjs")) {
     });
     sock.on("error", (e) => {
       const code = (e as NodeJS.ErrnoException).code;
-      if (code === "ENOENT" || code === "ECONNREFUSED") {
-        fail(
-          `vault-mcp: can't connect to vault '${chosen.vault_name}' — the 'Vault MCP' ` +
-            `plugin is disabled or Obsidian isn't running.\n  Fix: ${ENABLE_HINT}.\n` +
-            `  (socket: ${chosen.socket_path})`
-        );
-      }
+      if (code === "ENOENT" || code === "ECONNREFUSED") fail(connectFailMessage(chosen));
       fail(`vault-mcp bridge: ${e.message}`);
     });
     sock.on("close", () => process.exit(0));

@@ -1,6 +1,12 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { selectVault, filterLive } from "../bridge/bridge.ts";
+import {
+  selectVault,
+  filterLive,
+  noLiveMessage,
+  staleRequestedMessage,
+  connectFailMessage,
+} from "../bridge/bridge.ts";
 
 const A = { vault_name: "alpha", socket_path: "/a.sock" };
 const B = { vault_name: "beta", socket_path: "/b.sock" };
@@ -33,4 +39,21 @@ test("filterLive drops all when no sockets exist", () => {
 });
 test("filterLive treats an exists() throw as not-live", () => {
   assert.equal(filterLive([A], () => { throw new Error("boom"); }).length, 0);
+});
+
+test("noLiveMessage: stale discovery names the vault + plugin hint", () => {
+  const m = noLiveMessage([A]);
+  assert.match(m, /stale discovery for: alpha/);
+  assert.match(m, /disabled or Obsidian is closed/);
+});
+test("noLiveMessage: no discovery gives serving-MCP hint", () => {
+  assert.match(noLiveMessage([]), /no vault is currently serving MCP/);
+});
+test("staleRequestedMessage names the requested vault", () => {
+  assert.match(staleRequestedMessage("beta"), /vault 'beta' has a discovery but no live socket/);
+});
+test("connectFailMessage names vault + socket path", () => {
+  const m = connectFailMessage(A);
+  assert.match(m, /can't connect to vault 'alpha'/);
+  assert.match(m, /\/a\.sock/);
 });
