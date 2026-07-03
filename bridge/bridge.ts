@@ -97,6 +97,52 @@ function parseFlag(argv: string[], name: string): string | undefined {
   return i >= 0 && i + 1 < argv.length ? argv[i + 1] : undefined;
 }
 
+// Given the current discovery snapshot, decide what to do. Separated from the
+// wait loop so it stays pure and unit-testable.
+//   ok    — a vault is live and unambiguously chosen; connect to it.
+//   wait  — nothing usable *yet*, but a live vault could still appear
+//           (Obsidian mid-launch, plugin re-enabling). Retry until the deadline.
+//   fatal — waiting cannot help (multiple live vaults, none pinned). Fail now.
+export type Target =
+  | { kind: "ok"; chosen: Discovery }
+  | { kind: "wait" }
+  | { kind: "fatal"; message: string };
+
+export function resolveTarget(
+  live: Discovery[],
+  pick: string | undefined
+): Target {
+  if (pick) {
+    const hit = live.find((d) => d.vault_name === pick);
+    // A pinned vault that isn't live yet is retryable — it may still register.
+    return hit ? { kind: "ok", chosen: hit } : { kind: "wait" };
+  }
+  if (live.length === 1) return { kind: "ok", chosen: live[0] };
+  if (live.length === 0) return { kind: "wait" };
+  return {
+    kind: "fatal",
+    message: `vault-mcp: multiple vaults open; specify --vault <name>: ${live
+      .map((d) => d.vault_name)
+      .join(", ")}`,
+  };
+}
+
+// The diagnostic to emit once the wait budget is exhausted, mirroring the
+// precise cause the original one-shot bridge would have reported.
+export function deadlineMessage(
+  all: Discovery[],
+  pick: string | undefined
+): string {
+  if (pick) {
+    return all.some((d) => d.vault_name === pick)
+      ? staleRequestedMessage(pick)
+      : `vault-mcp: no vault named "${pick}"; available: ${all.map((d) => d.vault_name).join(", ") || "(none)"}`;
+  }
+  // Exactly one discovery we still couldn't reach: name it and its socket.
+  if (all.length === 1) return connectFailMessage(all[0]);
+  return noLiveMessage(all);
+}
+
 // Synchronous write to fd 2 so the message flushes before exit even when stderr
 // is a POSIX pipe (as it is when Claude Code spawns the bridge as an MCP server).
 function fail(msg: string): never {
@@ -108,30 +154,54 @@ function fail(msg: string): never {
   process.exit(1);
 }
 
+// How long to keep polling for a live vault socket before giving up, and how
+// often to poll. The wait closes the startup-order race: Claude Code often
+// spawns the bridge a moment before Obsidian's plugin has bound its socket, and
+// the original bridge failed instantly instead of waiting it out.
+const WAIT_MS = Number(process.env.VAULT_MCP_WAIT_MS ?? 30000);
+const POLL_MS = Number(process.env.VAULT_MCP_POLL_MS ?? 500);
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// Resolves to a connected socket, or null if the socket file exists but isn't
+// accepting yet (stale/just-restarted) — a retryable condition. Rejects only on
+// unexpected errors worth surfacing immediately.
+function tryConnect(chosen: Discovery): Promise<net.Socket | null> {
+  return new Promise((resolve, reject) => {
+    const sock = net.createConnection(chosen.socket_path);
+    sock.once("connect", () => resolve(sock));
+    sock.once("error", (e) => {
+      const code = (e as NodeJS.ErrnoException).code;
+      sock.destroy();
+      if (code === "ENOENT" || code === "ECONNREFUSED") resolve(null);
+      else reject(e);
+    });
+  });
+}
+
 // Entry point (skipped under test import; runs when executed as a script).
 if (process.argv[1] && process.argv[1].endsWith("bridge.mjs")) {
-  try {
-    const all = loadDiscoveries();
-    const live = filterLive(all);
-    if (live.length === 0) fail(noLiveMessage(all));
-    const pick = parseFlag(process.argv, "vault") ?? process.env.VAULT_MCP_VAULT;
-    // Requested a specific vault that has a (stale) discovery but isn't live.
-    if (pick && !live.some((d) => d.vault_name === pick) && all.some((d) => d.vault_name === pick)) {
-      fail(staleRequestedMessage(pick));
+  const pick = parseFlag(process.argv, "vault") ?? process.env.VAULT_MCP_VAULT;
+  const deadline = Date.now() + WAIT_MS;
+  (async () => {
+    for (;;) {
+      const all = loadDiscoveries();
+      const target = resolveTarget(filterLive(all), pick);
+      if (target.kind === "fatal") fail(target.message);
+      if (target.kind === "ok") {
+        const sock = await tryConnect(target.chosen);
+        if (sock) {
+          process.stdin.pipe(sock);
+          sock.pipe(process.stdout);
+          sock.on("close", () => process.exit(0));
+          return;
+        }
+        // Socket file present but not accepting yet — fall through and retry.
+      }
+      if (Date.now() >= deadline) fail(deadlineMessage(all, pick));
+      await sleep(POLL_MS);
     }
-    const chosen = selectVault(live, { flag: pick });
-    const sock = net.createConnection(chosen.socket_path);
-    sock.on("connect", () => {
-      process.stdin.pipe(sock);
-      sock.pipe(process.stdout);
-    });
-    sock.on("error", (e) => {
-      const code = (e as NodeJS.ErrnoException).code;
-      if (code === "ENOENT" || code === "ECONNREFUSED") fail(connectFailMessage(chosen));
-      fail(`vault-mcp bridge: ${e.message}`);
-    });
-    sock.on("close", () => process.exit(0));
-  } catch (e) {
-    fail(`vault-mcp bridge: ${(e as Error).message}`);
-  }
+  })().catch((e) => fail(`vault-mcp bridge: ${(e as Error).message}`));
 }
