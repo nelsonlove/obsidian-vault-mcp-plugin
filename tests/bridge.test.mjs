@@ -6,6 +6,8 @@ import {
   noLiveMessage,
   staleRequestedMessage,
   connectFailMessage,
+  resolveTarget,
+  deadlineMessage,
 } from "../bridge/bridge.ts";
 
 const A = { vault_name: "alpha", socket_path: "/a.sock" };
@@ -56,4 +58,39 @@ test("connectFailMessage names vault + socket path", () => {
   const m = connectFailMessage(A);
   assert.match(m, /can't connect to vault 'alpha'/);
   assert.match(m, /\/a\.sock/);
+});
+
+// --- resolveTarget: the retry-vs-fail-vs-connect decision ---
+test("resolveTarget: single live vault is chosen", () => {
+  assert.deepEqual(resolveTarget([A], undefined), { kind: "ok", chosen: A });
+});
+test("resolveTarget: none live yet is retryable (wait)", () => {
+  assert.deepEqual(resolveTarget([], undefined), { kind: "wait" });
+});
+test("resolveTarget: multiple live + no pick is fatal (waiting can't disambiguate)", () => {
+  const t = resolveTarget([A, B], undefined);
+  assert.equal(t.kind, "fatal");
+  assert.match(t.message, /multiple vaults open/);
+});
+test("resolveTarget: pinned vault present is chosen", () => {
+  assert.deepEqual(resolveTarget([A, B], "beta"), { kind: "ok", chosen: B });
+});
+test("resolveTarget: pinned vault not live yet waits (even with others live)", () => {
+  assert.deepEqual(resolveTarget([A], "beta"), { kind: "wait" });
+});
+
+// --- deadlineMessage: the diagnostic after the wait budget is spent ---
+test("deadlineMessage: pinned + known but unreachable → stale-requested", () => {
+  assert.match(deadlineMessage([B], "beta"), /vault 'beta' has a discovery but no live socket/);
+});
+test("deadlineMessage: pinned + never seen → no-vault-named + available list", () => {
+  const m = deadlineMessage([A], "beta");
+  assert.match(m, /no vault named "beta"/);
+  assert.match(m, /available: alpha/);
+});
+test("deadlineMessage: single unreachable discovery → connect-fail names socket", () => {
+  assert.match(deadlineMessage([A], undefined), /can't connect to vault 'alpha'/);
+});
+test("deadlineMessage: nothing discovered → serving-MCP hint", () => {
+  assert.match(deadlineMessage([], undefined), /no vault is currently serving MCP/);
 });
