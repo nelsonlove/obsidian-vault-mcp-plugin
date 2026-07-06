@@ -201,6 +201,33 @@ export function registerVaultWriteTools(server: McpServer, app: App) {
     }
   );
 
+  async function moveOne(from: string, to: string, overwrite: boolean): Promise<void> {
+    if (!from.endsWith(".md")) throw new Error("source must end in .md");
+    if (!to.endsWith(".md")) throw new Error("destination must end in .md");
+    if (from === to) throw new Error("from and to are the same path");
+    const file = app.vault.getAbstractFileByPath(from);
+    if (!(file instanceof TFile)) throw new Error(`not found: ${from}`);
+    const dest = app.vault.getAbstractFileByPath(to);
+    let trashedDest = false;
+    if (dest) {
+      if (!overwrite) throw new Error(`destination exists (set overwrite=true): ${to}`);
+      // Recoverable delete: if the subsequent rename fails, the overwritten note is in trash.
+      if (dest instanceof TFile) {
+        await app.vault.trash(dest, true);
+        trashedDest = true;
+      }
+    }
+    await ensureParentFolders(app, to);
+    try {
+      await app.fileManager.renameFile(file, to);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      if (trashedDest)
+        throw new Error(`${msg} (the note previously at '${to}' was already moved to Obsidian trash and is recoverable there)`);
+      throw e;
+    }
+  }
+
   server.registerTool(
     "obsidian_move_note",
     {
@@ -215,18 +242,7 @@ export function registerVaultWriteTools(server: McpServer, app: App) {
     },
     async ({ from, to, overwrite }) => {
       try {
-        if (!to.endsWith(".md")) return fail(new Error("destination must end in .md"));
-        if (from === to) return fail(new Error("from and to are the same path"));
-        const file = app.vault.getAbstractFileByPath(from);
-        if (!(file instanceof TFile)) return fail(new Error(`not found: ${from}`));
-        const dest = app.vault.getAbstractFileByPath(to);
-        if (dest) {
-          if (!overwrite) return fail(new Error(`destination exists (set overwrite=true): ${to}`));
-          // Recoverable delete: if the subsequent rename fails, the overwritten note is in trash.
-          if (dest instanceof TFile) await app.vault.trash(dest, true);
-        }
-        await ensureParentFolders(app, to);
-        await app.fileManager.renameFile(file, to);
+        await moveOne(from, to, overwrite);
         return ok({ from, to, moved: true });
       } catch (e) { return fail(e); }
     }
@@ -263,24 +279,15 @@ export function registerVaultWriteTools(server: McpServer, app: App) {
       const errors: Array<{ from: string; to: string; error: string }> = [];
       for (const { from, to } of moves) {
         try {
-          if (!to.endsWith(".md")) throw new Error("destination must end in .md");
-          if (from === to) throw new Error("from and to are the same path");
-          const file = app.vault.getAbstractFileByPath(from);
-          if (!(file instanceof TFile)) throw new Error(`not found: ${from}`);
-          const dest = app.vault.getAbstractFileByPath(to);
-          if (dest) {
-            if (!overwrite) throw new Error(`destination exists (set overwrite=true): ${to}`);
-            // Recoverable delete: if the subsequent rename fails, the overwritten note is in trash.
-            if (dest instanceof TFile) await app.vault.trash(dest, true);
-          }
-          await ensureParentFolders(app, to);
-          await app.fileManager.renameFile(file, to);
+          await moveOne(from, to, overwrite);
           moved.push({ from, to });
         } catch (e) {
           errors.push({ from, to, error: e instanceof Error ? e.message : String(e) });
         }
       }
-      return ok({ count: moved.length, error_count: errors.length, moved, errors });
+      const result = ok({ count: moved.length, error_count: errors.length, moved, errors });
+      // Partial failure is tolerated, but total failure must carry the standard MCP error flag.
+      return moved.length === 0 ? { ...result, isError: true as const } : result;
     }
   );
 
