@@ -1,6 +1,6 @@
 # vault-mcp — architecture & working notes for Claude Code
 
-An Obsidian plugin (id `vault-mcp`) embedding an MCP server with direct `app.*` access, reached by Claude Code via a Unix socket + bundled stdio bridge. Local-with-Obsidian counterpart to the remote, filesystem-only `obsidian-vault-mcp-server` (JD 92046). This repo is JD 92050; the design spec lives in the vault at `90-99 Projects/92 Software/92050 obsidian-vault-mcp-plugin/92050.10 Requirements & design/`.
+An Obsidian plugin (id `vault-mcp`) embedding an MCP server with direct `app.*` access, reached by Claude Code via a Unix socket + bundled stdio bridge. Local-with-Obsidian counterpart to the remote, filesystem-only `obsidian-vault-mcp-server` (JD 92046). Design specs and implementation plans live in the vault at `00-09 System/03 LLMs & agents/03.20 Vault MCP/` (the former JD 92050 project slot is retired).
 
 ## Locked decisions (don't relitigate without reason)
 
