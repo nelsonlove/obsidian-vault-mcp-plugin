@@ -33,7 +33,7 @@ It is the **local-with-Obsidian** counterpart to [`obsidian-vault-mcp-server`](h
    cp main.js manifest.json <vault>/.obsidian/plugins/vault-mcp/
    ```
    Then Settings → Community plugins → enable **Vault MCP**.
-3. **Connect Claude Code** — run the command **`vault-mcp: Connect to Claude Code`** from the command palette. With a single vault it runs `claude mcp add --scope user vault-mcp -- node ~/.claude/vault-mcp/bridge.mjs` for you (one-time, persists across sessions). If the `claude` CLI can't be found, it shows the exact line to paste; the same line is always available in **Settings → Vault MCP → Claude Code connection**.
+3. **Connect Claude Code** — run the command **`vault-mcp: Connect to Claude Code`** from the command palette. It runs `claude mcp add --scope user vault-mcp -- node ~/.claude/vault-mcp/bridge.mjs --vault <this vault>` for you (one-time, persists across sessions). The `--vault` pin keeps the registration unambiguous once a second vault also serves MCP — without it the bridge aborts with `multiple vaults open; specify --vault`. If the `claude` CLI can't be found, it shows the exact line to paste; the same line is always available in **Settings → Vault MCP → Claude Code connection**. To point Claude Code at a different vault later, run Connect from that vault (or edit the `--vault <name>` value in the config).
 4. **Restart any open Claude Code session** — MCP servers load at session start.
 
 On the Mac, **disconnect the remote `obsidian-vault-mcp-server` connector** for that session so you don't have two Obsidian tool sets at once. They share `obsidian_*` names by design; this local one gives canonical returns.
@@ -63,7 +63,7 @@ Run **`obsidian_doctor`** (tool) or **`vault-mcp: Show diagnostics`** (command) 
 | Claude Code says the MCP is unreachable | Obsidian isn't running, or the plugin is disabled. Open Obsidian / enable the plugin. |
 | "auto register failed, no such file or directory" | The `claude` launcher needs `node` on PATH; the plugin augments PATH with `/opt/homebrew/bin` + `/usr/local/bin`. If your `node`/`claude` live elsewhere, run the `claude mcp add` line manually in a terminal where `claude` works. |
 | Tools don't appear in a session | You registered after the session started — restart the Claude Code session (MCP loads at start). |
-| Multiple vaults open | The bridge needs `--vault <name>`; `obsidian_doctor` reports the bound vault. |
+| Multiple vaults open | The registration must pin `--vault <name>` (Connect does this for the vault you run it from); `obsidian_doctor` reports the bound vault. A registration made before a second vault existed may be generic — re-run Connect, or add `--vault <name>` to the existing `claude mcp` entry. |
 | A plugin-gated tool is missing | Its backing plugin isn't loaded. Enable it; the tool appears on the next session connect. |
 
 ## Repo

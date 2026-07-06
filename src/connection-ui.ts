@@ -4,9 +4,16 @@ import { buildRegisterCommand } from "./register-command.js";
 import { bridgeDestPath } from "./paths.js";
 import { findClaudeBinary, claudeIsRegistered } from "./claude-cli.js";
 
-export function registerCommandFor(_app: App): string {
-  return buildRegisterCommand({ bridgePath: bridgeDestPath() });
+export function registerCommandFor(app: App): string {
+  // Pin the current vault so the command stays unambiguous once a second vault
+  // starts serving MCP. To point Claude Code at a different vault, re-run this
+  // from that vault (or edit the `--vault <name>` value in the registered config).
+  return buildRegisterCommand({ bridgePath: bridgeDestPath(), vaultName: app.vault.getName() });
 }
+
+// Shown alongside the manual command so the pinned `--vault` isn't a surprise.
+export const SWITCH_VAULT_NOTE =
+  "This command pins Claude Code to this vault via `--vault`. To switch vaults later, run Connect from the other vault, or edit the `--vault <name>` value in the config.";
 
 async function copyToClipboard(text: string): Promise<void> {
   await navigator.clipboard.writeText(text);
@@ -28,6 +35,7 @@ export class ConnectionSetupModal extends Modal {
     copyBtn.onclick = () => copyToClipboard(cmd);
     const ackBtn = btns.createEl("button", { text: "I've run it — don't show again" });
     ackBtn.onclick = () => { this.onAck?.(); this.close(); };
+    contentEl.createEl("p", { cls: "mod-warning", text: SWITCH_VAULT_NOTE });
     contentEl.createEl("p", {
       cls: "mod-warning",
       text: "Paste in a terminal where the `claude` CLI is available. Restart any running Claude Code session afterward.",
@@ -74,6 +82,7 @@ export class VaultMcpSettingTab extends PluginSettingTab {
     });
     const cmd = registerCommandFor(this.app);
     containerEl.createEl("pre").createEl("code", { text: cmd });
+    containerEl.createEl("p", { cls: "setting-item-description", text: SWITCH_VAULT_NOTE });
     new Setting(containerEl)
       .addButton((b) => b.setButtonText("Copy command").setCta().onClick(() => copyToClipboard(cmd)))
       .addButton((b) => b.setButtonText("Open setup popup").onClick(() => new ConnectionSetupModal(this.app).open()));

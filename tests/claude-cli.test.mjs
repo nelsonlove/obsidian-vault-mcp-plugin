@@ -1,6 +1,20 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { findClaudeBinary, spawnEnv } from "../src/claude-cli.ts";
+import { findClaudeBinary, spawnEnv, registerArgs } from "../src/claude-cli.ts";
+
+test("registerArgs omits --vault when no vault name", () => {
+  assert.deepEqual(
+    registerArgs("/p/bridge.mjs"),
+    ["mcp", "add", "--scope", "user", "vault-mcp", "--", "node", "/p/bridge.mjs"]
+  );
+});
+
+test("registerArgs pins --vault when given (spaces kept intact — argv, not shell)", () => {
+  assert.deepEqual(
+    registerArgs("/p/bridge.mjs", "My Vault"),
+    ["mcp", "add", "--scope", "user", "vault-mcp", "--", "node", "/p/bridge.mjs", "--vault", "My Vault"]
+  );
+});
 
 test("returns first existing candidate", () => {
   const got = findClaudeBinary({
