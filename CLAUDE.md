@@ -1,6 +1,6 @@
 # vault-mcp — architecture & working notes for Claude Code
 
-An Obsidian plugin (id `vault-mcp`) embedding an MCP server with direct `app.*` access, reached by Claude Code via a Unix socket + bundled stdio bridge. Local-with-Obsidian counterpart to the remote, filesystem-only `obsidian-vault-mcp-server` (JD 92046). This repo is JD 92050; the design spec lives in the vault at `90-99 Projects/92 Software/92050 obsidian-vault-mcp-plugin/92050.10 Requirements & design/`.
+An Obsidian plugin (id `vault-mcp`) embedding an MCP server with direct `app.*` access, reached by Claude Code via a Unix socket + bundled stdio bridge. Local-with-Obsidian counterpart to the remote, filesystem-only `obsidian-vault-mcp-server` (JD 92046). Design specs and implementation plans live in the vault at `00-09 System/03 LLMs & agents/03.20 Vault MCP/` (the former JD 92050 project slot is retired).
 
 ## Locked decisions (don't relitigate without reason)
 
@@ -9,7 +9,7 @@ An Obsidian plugin (id `vault-mcp`) embedding an MCP server with direct `app.*` 
 - **State namespace: `~/.claude/vault-mcp/`** holds `bridge.mjs`, `<vault-slug>.sock`, `<vault-slug>.json`. Resolve `~` via `os.homedir()`.
 - **Never write `~/.claude.json` directly.** Registration goes only through spawning the `claude` binary (`claudeRegister` in `src/claude-cli.ts`). When spawning `claude`, augment PATH (`spawnEnv`) — Obsidian's GUI PATH is minimal and the `claude` launcher shim runs `#!/usr/bin/env node`.
 - **Plugin-gated tools gate on the LOADED instance** (`app.plugins.plugins[id]`), not `app.plugins.enabledPlugins` — `enabledPlugins` can list a configured-but-uninstalled plugin (stale entry).
-- **`ok()` returns both `content` (text) and `structuredContent`.** `fail()` returns `isError: true`. Match the 92046 shapes; tool names are the identical `obsidian_*` set (strict-superset).
+- **`ok()` returns both `content` (text) and `structuredContent`.** `fail()` returns `isError: true`. `okError()` is ok()'s shape plus `isError: true` — for batch tools whose structured per-item report must survive a total failure (fail() would flatten it to text). Match the 92046 shapes; tool names are the identical `obsidian_*` set (strict-superset).
 - **Safety guard** (`src/guard.ts`) is applied by monkey-patching `server.registerTool` in `buildMcpServer` (single interception point). A tool is mutating iff `annotations.readOnlyHint === false`. Read-only mode blocks mutating tools; the path allowlist normalizes paths (`posix.normalize`, reject `..` escapes) before prefix-matching.
 - **`isDesktopOnly: true`.** Node `net`/`fs` from the renderer.
 

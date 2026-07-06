@@ -12,6 +12,13 @@ export function collectPaths(args: Record<string, unknown>): string[] {
     if (typeof v === "string" && v) out.push(v);
   }
   if (Array.isArray(args.paths)) for (const p of args.paths) if (typeof p === "string" && p) out.push(p);
+  if (Array.isArray(args.moves))
+    for (const m of args.moves) {
+      if (!m || typeof m !== "object") continue;
+      const { from, to } = m as Record<string, unknown>;
+      if (typeof from === "string" && from) out.push(from);
+      if (typeof to === "string" && to) out.push(to);
+    }
   return out;
 }
 
