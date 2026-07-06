@@ -26,8 +26,8 @@ Both share `hooks/scripts/vault-mcp-health.mjs` (Node only — no extra deps).
 ## Install
 
 ```
-/plugin marketplace add nelsonlove/obsidian-vault-mcp-plugin
-/plugin install vault-mcp-connect@vault-mcp
+/plugin marketplace add nelsonlove/claude-code-plugins
+/plugin install vault-mcp-connect@claude-code-plugins-mac
 ```
 
 ## Configuration
