@@ -233,6 +233,56 @@ export function registerVaultWriteTools(server: McpServer, app: App) {
   );
 
   server.registerTool(
+    "obsidian_move_notes",
+    {
+      title: "Move/rename multiple notes",
+      description:
+        "Move or rename several notes in one call. Items are processed sequentially; backlinks are rewritten canonically by Obsidian's fileManager.renameFile. A failed item is reported in `errors` and does not fail the call.",
+      inputSchema: {
+        moves: z
+          .array(
+            z.object({
+              from: z.string().min(1).describe("Existing vault-relative path ending in .md."),
+              to: z.string().min(1).describe("New vault-relative path ending in .md."),
+            })
+          )
+          .min(1)
+          .max(50)
+          .describe("Move/rename operations, e.g. [{from:'Inbox/A.md',to:'Archive/A.md'}]."),
+        overwrite: z
+          .boolean()
+          .default(false)
+          .describe("Applies to every item: replace an existing destination (the previous note goes to trash)."),
+      },
+      annotations: RW,
+    },
+    async ({ moves, overwrite }) => {
+      const moved: Array<{ from: string; to: string }> = [];
+      const errors: Array<{ from: string; to: string; error: string }> = [];
+      for (const { from, to } of moves) {
+        try {
+          if (!to.endsWith(".md")) throw new Error("destination must end in .md");
+          if (from === to) throw new Error("from and to are the same path");
+          const file = app.vault.getAbstractFileByPath(from);
+          if (!(file instanceof TFile)) throw new Error(`not found: ${from}`);
+          const dest = app.vault.getAbstractFileByPath(to);
+          if (dest) {
+            if (!overwrite) throw new Error(`destination exists (set overwrite=true): ${to}`);
+            // Recoverable delete: if the subsequent rename fails, the overwritten note is in trash.
+            if (dest instanceof TFile) await app.vault.trash(dest, true);
+          }
+          await ensureParentFolders(app, to);
+          await app.fileManager.renameFile(file, to);
+          moved.push({ from, to });
+        } catch (e) {
+          errors.push({ from, to, error: e instanceof Error ? e.message : String(e) });
+        }
+      }
+      return ok({ count: moved.length, error_count: errors.length, moved, errors });
+    }
+  );
+
+  server.registerTool(
     "obsidian_delete_note",
     {
       title: "Delete a note",
