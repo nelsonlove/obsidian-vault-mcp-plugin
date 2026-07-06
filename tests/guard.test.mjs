@@ -81,3 +81,51 @@ test("allowlist allows a '..' that stays within the prefix after normalization",
   });
   assert.equal(result, null);
 });
+
+// moves[] (batch move tool)
+test("collectPaths gathers moves[] from/to pairs", () => {
+  const result = collectPaths({
+    moves: [
+      { from: "Inbox/A.md", to: "Archive/A.md" },
+      { from: "Inbox/B.md", to: "Archive/B.md" },
+    ],
+  });
+  assert.deepEqual(result, ["Inbox/A.md", "Archive/A.md", "Inbox/B.md", "Archive/B.md"]);
+});
+
+test("collectPaths ignores non-object and non-string entries in moves[]", () => {
+  const result = collectPaths({
+    moves: [null, 42, { from: "ok.md", to: 7 }, { from: "", to: "also-ok.md" }],
+  });
+  assert.deepEqual(result, ["ok.md", "also-ok.md"]);
+});
+
+test("allowlist blocks an out-of-prefix moves[] destination", () => {
+  const blocked = guardCall({
+    isMutating: true,
+    args: { moves: [{ from: "Notes/a.md", to: "Private/a.md" }] },
+    settings: { readOnly: false, allowlist: ["Notes"] },
+  });
+  assert.ok(blocked);
+  assert.equal(blocked.code, "out_of_allowlist");
+  assert.ok(blocked.message.includes("Private/a.md"));
+});
+
+test("allowlist blocks a traversal path inside moves[]", () => {
+  const blocked = guardCall({
+    isMutating: true,
+    args: { moves: [{ from: "Notes/a.md", to: "Notes/../Private/a.md" }] },
+    settings: { readOnly: false, allowlist: ["Notes"] },
+  });
+  assert.ok(blocked);
+  assert.equal(blocked.code, "out_of_allowlist");
+});
+
+test("allowlist allows in-prefix moves[]", () => {
+  const result = guardCall({
+    isMutating: true,
+    args: { moves: [{ from: "Notes/a.md", to: "Notes/sub/a.md" }] },
+    settings: { readOnly: false, allowlist: ["Notes"] },
+  });
+  assert.equal(result, null);
+});
