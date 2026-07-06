@@ -1,0 +1,12 @@
+{
+  "name": "vault-mcp-connect",
+  "version": "0.1.0",
+  "description": "Session-start health check and status command for the vault-mcp Obsidian bridge — warns when the mcp__vault-mcp__* tools will fail because Obsidian isn't serving the socket.",
+  "author": {
+    "name": "Nelson Love",
+    "url": "https://github.com/nelsonlove"
+  },
+  "repository": "https://github.com/nelsonlove/obsidian-vault-mcp-plugin",
+  "license": "MIT",
+  "keywords": ["obsidian", "mcp", "vault-mcp", "connectivity", "healthcheck"]
+}
