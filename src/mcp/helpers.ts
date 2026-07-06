@@ -1,3 +1,5 @@
+import { posix } from "node:path";
+
 export function ok(data: unknown) {
   return {
     content: [{ type: "text" as const, text: JSON.stringify(data, null, 2) }],
@@ -10,15 +12,30 @@ export function fail(err: unknown) {
   return { content: [{ type: "text" as const, text: `Error: ${message}` }], isError: true as const };
 }
 
+// ok()'s shape plus the MCP error flag: for batch tools whose structured
+// per-item report must survive a total failure (fail() would flatten it to text).
+export function okError(data: unknown) {
+  return { ...ok(data), isError: true as const };
+}
+
+// Static validation for a batch of moves, all checked before any item runs.
 // Sequential batch moves make swaps/chains destructive with overwrite=true (an
-// earlier item can trash or consume a note a later item depends on), so an
-// internally-conflicting batch is rejected before any item runs.
-export function batchMoveConflicts(moves: Array<{ from: string; to: string }>): string | null {
+// earlier item can trash or consume a note a later item depends on), and
+// mid-batch input errors would leave the vault partially mutated — so any
+// statically-detectable problem rejects the whole batch up front. Paths are
+// normalized before comparison so './' and '..' aliases can't slip past
+// (mirrors guardCall's normalize-before-compare).
+export function validateMoves(moves: Array<{ from: string; to: string }>): string | null {
   const froms = new Set<string>();
   const tos = new Set<string>();
-  for (const { from, to } of moves) {
-    if (froms.has(from)) return `duplicate source: ${from}`;
-    if (tos.has(to)) return `duplicate destination: ${to}`;
+  for (const { from: rawFrom, to: rawTo } of moves) {
+    if (!rawFrom.endsWith(".md")) return `source must end in .md: ${rawFrom}`;
+    if (!rawTo.endsWith(".md")) return `destination must end in .md: ${rawTo}`;
+    const from = posix.normalize(rawFrom);
+    const to = posix.normalize(rawTo);
+    if (from === to) return `from and to are the same path: ${rawFrom}`;
+    if (froms.has(from)) return `duplicate source: ${rawFrom}`;
+    if (tos.has(to)) return `duplicate destination: ${rawTo}`;
     froms.add(from);
     tos.add(to);
   }

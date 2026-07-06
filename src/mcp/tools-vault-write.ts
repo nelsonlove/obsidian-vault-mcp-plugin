@@ -1,7 +1,7 @@
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { type App, TFile } from "obsidian";
-import { ok, fail, batchMoveConflicts } from "./helpers.js";
+import { ok, fail, okError, validateMoves } from "./helpers.js";
 
 const RW = { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false };
 const DESTRUCTIVE = { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false };
@@ -223,7 +223,7 @@ export function registerVaultWriteTools(server: McpServer, app: App) {
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       if (trashedDest)
-        throw new Error(`${msg} (the note previously at '${to}' was already moved to Obsidian trash and is recoverable there)`);
+        throw new Error(`${msg} (the note previously at '${to}' was already moved to the system trash and is recoverable there)`);
       throw e;
     }
   }
@@ -253,7 +253,7 @@ export function registerVaultWriteTools(server: McpServer, app: App) {
     {
       title: "Move/rename multiple notes",
       description:
-        "Move or rename several notes in one call. Items are processed sequentially; backlinks are rewritten canonically by Obsidian's fileManager.renameFile. A failed item is reported in `errors` and does not fail the call, but if every item fails the call is flagged as an error. Batches where a path appears twice as a source, twice as a destination, or as both a source and a destination (swaps/chains) are rejected up front with no moves performed.",
+        "Move or rename several notes in one call. Items are processed sequentially; backlinks are rewritten canonically by Obsidian's fileManager.renameFile. A runtime-failed item (missing source, existing destination) is reported in `errors` and does not fail the call, but if every item fails the call is flagged as an error. Statically invalid batches are rejected up front with no moves performed: a non-.md path, an item whose from and to are identical, or a path appearing twice as a source, twice as a destination, or as both (swaps/chains) — compared after normalization.",
       inputSchema: {
         moves: z
           .array(
@@ -273,8 +273,8 @@ export function registerVaultWriteTools(server: McpServer, app: App) {
       annotations: RW,
     },
     async ({ moves, overwrite }) => {
-      const conflict = batchMoveConflicts(moves);
-      if (conflict) return fail(new Error(`conflicting batch, no moves performed — ${conflict}`));
+      const invalid = validateMoves(moves);
+      if (invalid) return fail(new Error(`invalid batch, no moves performed — ${invalid}`));
       const moved: Array<{ from: string; to: string }> = [];
       const errors: Array<{ from: string; to: string; error: string }> = [];
       for (const { from, to } of moves) {
@@ -285,9 +285,9 @@ export function registerVaultWriteTools(server: McpServer, app: App) {
           errors.push({ from, to, error: e instanceof Error ? e.message : String(e) });
         }
       }
-      const result = ok({ count: moved.length, error_count: errors.length, moved, errors });
+      const payload = { count: moved.length, error_count: errors.length, moved, errors };
       // Partial failure is tolerated, but total failure must carry the standard MCP error flag.
-      return moved.length === 0 ? { ...result, isError: true as const } : result;
+      return moved.length === 0 ? okError(payload) : ok(payload);
     }
   );
 
