@@ -1,7 +1,7 @@
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { type App, TFile } from "obsidian";
-import { ok, fail } from "./helpers.js";
+import { ok, fail, batchMoveConflicts } from "./helpers.js";
 
 const RW = { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false };
 const DESTRUCTIVE = { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false };
@@ -237,7 +237,7 @@ export function registerVaultWriteTools(server: McpServer, app: App) {
     {
       title: "Move/rename multiple notes",
       description:
-        "Move or rename several notes in one call. Items are processed sequentially; backlinks are rewritten canonically by Obsidian's fileManager.renameFile. A failed item is reported in `errors` and does not fail the call.",
+        "Move or rename several notes in one call. Items are processed sequentially; backlinks are rewritten canonically by Obsidian's fileManager.renameFile. A failed item is reported in `errors` and does not fail the call, but if every item fails the call is flagged as an error. Batches where a path appears twice as a source, twice as a destination, or as both a source and a destination (swaps/chains) are rejected up front with no moves performed.",
       inputSchema: {
         moves: z
           .array(
@@ -257,6 +257,8 @@ export function registerVaultWriteTools(server: McpServer, app: App) {
       annotations: RW,
     },
     async ({ moves, overwrite }) => {
+      const conflict = batchMoveConflicts(moves);
+      if (conflict) return fail(new Error(`conflicting batch, no moves performed — ${conflict}`));
       const moved: Array<{ from: string; to: string }> = [];
       const errors: Array<{ from: string; to: string; error: string }> = [];
       for (const { from, to } of moves) {
