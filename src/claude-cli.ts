@@ -41,9 +41,18 @@ export async function claudeIsRegistered(bin: string): Promise<boolean> {
   }
 }
 
-export async function claudeRegister(bin: string, bridgePath: string): Promise<void> {
-  // Generic registration; Claude Code writes its own user config.
-  await pexecFile(bin, ["mcp", "add", "--scope", "user", "vault-mcp", "--", "node", bridgePath], { env: spawnEnv() });
+// Pure + testable: the `claude mcp add` argv. Pins `--vault <name>` when given
+// so the bridge is unambiguous once a second vault starts serving MCP (without
+// it, the bridge aborts with "multiple vaults open; specify --vault").
+export function registerArgs(bridgePath: string, vaultName?: string): string[] {
+  const args = ["mcp", "add", "--scope", "user", "vault-mcp", "--", "node", bridgePath];
+  if (vaultName) args.push("--vault", vaultName);
+  return args;
+}
+
+export async function claudeRegister(bin: string, bridgePath: string, vaultName?: string): Promise<void> {
+  // Claude Code writes its own user config; we only invoke the CLI.
+  await pexecFile(bin, registerArgs(bridgePath, vaultName), { env: spawnEnv() });
 }
 
 export async function claudeRemove(bin: string): Promise<void> {

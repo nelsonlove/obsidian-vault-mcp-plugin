@@ -46,7 +46,7 @@ export default class VaultMcpPlugin extends Plugin {
         if (force) new Notice("vault-mcp: already connected to Claude Code.");
         return;
       }
-      await claudeRegister(bin, bridgeDestPath());
+      await claudeRegister(bin, bridgeDestPath(), this.app.vault.getName());
       new Notice("vault-mcp: connected to Claude Code. Restart any open Claude Code session to use it.");
     } catch (e) {
       new Notice(`vault-mcp: auto-register failed — ${(e as Error).message}. Use the manual command in settings.`);
