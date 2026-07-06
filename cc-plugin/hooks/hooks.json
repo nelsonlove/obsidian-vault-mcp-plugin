@@ -1,0 +1,17 @@
+{
+  "description": "vault-mcp connectivity — warn at session start when the Obsidian bridge socket is down.",
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"$CLAUDE_PLUGIN_ROOT/hooks/scripts/vault-mcp-health.mjs\"",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}
