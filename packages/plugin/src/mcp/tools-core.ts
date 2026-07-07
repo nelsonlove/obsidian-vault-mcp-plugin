@@ -1,4 +1,8 @@
-import { z } from "zod";
+// obsidian_resolve and obsidian_get_backlinks have been migrated to
+// registerFsTools + ObsidianBackend in server.ts (fs-expressible tools).
+// This file retains only obsidian_doctor and obsidian_get_active_note
+// (live-only: they use workspace/app state not expressible on the filesystem).
+
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { App, TFile } from "obsidian";
 import { ok, fail } from "./helpers.js";
@@ -56,49 +60,6 @@ export function registerCoreTools(server: McpServer, app: App, ctx: ServerCtx) {
         const mv = app.workspace.activeEditor;
         if (mv?.editor) selection = mv.editor.getSelection() || null;
         return ok({ active: { path: file.path, content, selection } });
-      } catch (e) { return fail(e); }
-    }
-  );
-
-  server.registerTool(
-    "obsidian_resolve",
-    {
-      title: "Resolve link reference",
-      description: "Resolve a wikilink/path/basename to a canonical vault path using Obsidian's own resolver. Read-only.",
-      inputSchema: {
-        ref: z.string().min(1).describe("Link text, basename, or path, e.g. '[[Roadmap]]' or 'Roadmap'."),
-        from: z.string().optional().describe("Source note path for context-sensitive resolution."),
-      },
-      annotations: RO,
-    },
-    async ({ ref, from }) => {
-      try {
-        const clean = ref.replace(/^\[\[/, "").replace(/\]\]$/, "").split("|")[0].split("#")[0];
-        const dest = app.metadataCache.getFirstLinkpathDest(clean, from ?? "");
-        return ok({ ref, resolved: dest ? dest.path : null });
-      } catch (e) { return fail(e); }
-    }
-  );
-
-  server.registerTool(
-    "obsidian_get_backlinks",
-    {
-      title: "Get backlinks",
-      description: "List notes that link TO the given note, from Obsidian's live metadata cache (canonical — resolves aliases, embeds, block refs). Read-only.",
-      inputSchema: {
-        path: z.string().min(1).describe("Vault-relative path of the target note."),
-      },
-      annotations: RO,
-    },
-    async ({ path: p }) => {
-      try {
-        const file = app.vault.getAbstractFileByPath(p);
-        if (!file) return fail(new Error(`not found: ${p}`));
-        // getBacklinksForFile is not in the public obsidian type defs — cast required.
-        // The {data: Map<path, ReferenceCache[]>} return shape is an assumption to be verified live in M1.9.
-        const bl = (app.metadataCache as any).getBacklinksForFile(file);
-        const sources = bl?.data ? Array.from(bl.data.keys()) : [];
-        return ok({ path: p, backlink_count: sources.length, backlinks: sources });
       } catch (e) { return fail(e); }
     }
   );
