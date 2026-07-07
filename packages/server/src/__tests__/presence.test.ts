@@ -155,6 +155,10 @@ describe("PresenceMonitor", () => {
   /**
    * 4. on("down") fires when a live socket is closed while the monitor is running.
    *    Uses a short pollMs (50 ms) so the interval detects the change quickly.
+   *
+   *    Note: on macOS, Node.js does NOT delete the socket file when the server closes,
+   *    so the "down" event requires 2 consecutive failed probes (≈ 2 × pollMs ≈ 100 ms),
+   *    still comfortably within the 2 000 ms waitForEvent timeout.
    */
   test('on("down") fires when a live socket is closed while monitoring', async () => {
     const sockPath = makeTmpSock();
@@ -172,10 +176,93 @@ describe("PresenceMonitor", () => {
       // Subscribe to 'down' before closing the server so we don't miss it
       const downEvent = waitForEvent(monitor, "down", 2000);
       await closeServer(server);
-      // The next poll (≤50 ms away) should detect the closed socket
+      // Two consecutive polls (≤ 2 × 50 ms) should detect the closed socket
       await downEvent;
 
       assert.equal(monitor.isLive(), false, "isLive() should be false after 'down' event");
+    } finally {
+      monitor.stop();
+      fs.rmSync(sockPath, { force: true });
+    }
+  });
+
+  /**
+   * 6. Debounce: a single spurious connect-failure while the socket FILE exists
+   *    does NOT emit "down"; two consecutive failures do.
+   *
+   *    Uses _pollForTest() to invoke exactly one poll cycle per phase, bypassing
+   *    the interval timer and fs.watch entirely.  This avoids macOS FSEvents
+   *    coalescing (where a recent writeFileSync can be delivered as a spurious
+   *    event to a newly-created fs.watch, triggering an unintended second probe).
+   *
+   *    The zombie file (regular file at the socket path) makes fs.existsSync()
+   *    return true so the debounce path is exercised, regardless of whether macOS
+   *    keeps or removes the socket file after server.close().
+   */
+  test("single connect-failure while socket file exists does NOT emit 'down'; two consecutive do", async () => {
+    const sockPath = makeTmpSock();
+    const monitor = createPresenceMonitor({ socketPath: sockPath, pollMs: 60_000 });
+    let downCount = 0;
+    monitor.on("down", () => { downCount++; });
+
+    try {
+      // Phase 1: advance the monitor to cached=true ("up") via one explicit poll.
+      const server = await startServer(sockPath);
+      await monitor._pollForTest(); // probeNow=true → cached=true, emit "up"
+      assert.equal(monitor.isLive(), true, "pre-condition: monitor is live");
+      assert.equal(downCount, 0, "pre-condition: no 'down' emitted yet");
+
+      // Plant a zombie: close the server and replace the socket with a plain
+      // regular file so fs.existsSync(sockPath)=true but net.connect() fails
+      // (ENOTSOCK) — the "ambiguous transient failure" path in poll().
+      await closeServer(server);
+      try { fs.unlinkSync(sockPath); } catch { /* may already be gone */ }
+      fs.writeFileSync(sockPath, "zombie");
+
+      // Phase 2: first failure probe — file exists, connect fails →
+      // consecutiveConnectFailures becomes 1 → must NOT emit "down" yet.
+      await monitor._pollForTest();
+      assert.equal(downCount, 0, "single connect-failure must not emit 'down'");
+      assert.equal(monitor.isLive(), true, "isLive() must still be true after 1 failure");
+
+      // Phase 3: second consecutive failure probe →
+      // consecutiveConnectFailures becomes 2 → must emit "down".
+      await monitor._pollForTest();
+      assert.equal(downCount, 1, "two consecutive connect-failures must emit 'down' exactly once");
+      assert.equal(monitor.isLive(), false, "isLive() must be false after 'down'");
+    } finally {
+      monitor.stop();
+      fs.rmSync(sockPath, { force: true });
+    }
+  });
+
+  /**
+   * 7. Fast path: deleting the socket file emits "down" on the very first failed probe.
+   *
+   *    When fs.existsSync(socketPath) returns false, Obsidian definitively unloaded
+   *    the plugin — no debounce needed.  "down" must fire immediately (first probe).
+   *    Uses _pollForTest() for the same reason as test 6 (no fs.watch interference).
+   */
+  test("deleting the socket file emits 'down' on the first probe", async () => {
+    const sockPath = makeTmpSock();
+    const server = await startServer(sockPath);
+    const monitor = createPresenceMonitor({ socketPath: sockPath, pollMs: 60_000 });
+    let downCount = 0;
+    monitor.on("down", () => { downCount++; });
+
+    try {
+      // Get to "up" state via one explicit poll.
+      await monitor._pollForTest(); // probeNow=true → cached=true, emit "up"
+      assert.equal(monitor.isLive(), true, "pre-condition: monitor is live");
+
+      // Close the server AND explicitly delete the socket file.
+      await closeServer(server);
+      fs.rmSync(sockPath, { force: true });
+
+      // First probe: fs.existsSync returns false → immediate "down" (no debounce).
+      await monitor._pollForTest();
+      assert.equal(downCount, 1, "socket file gone → 'down' must fire on the first probe");
+      assert.equal(monitor.isLive(), false, "isLive() must be false after 'down'");
     } finally {
       monitor.stop();
       fs.rmSync(sockPath, { force: true });

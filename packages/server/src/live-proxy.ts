@@ -179,7 +179,7 @@ export function createLiveProxy(opts: {
       if (torndown) return;
       torndown = true;
       clearTimeout(initTimer);
-      liveBackends--;
+      liveBackends = Math.max(0, liveBackends - 1);
       const sid = http.sessionId;
       if (sid) sessions.delete(sid);
       backend.close().catch(() => {});
@@ -346,7 +346,7 @@ export function createLiveProxy(opts: {
       const teardown = () => {
         if (torndown) return;
         torndown = true;
-        liveBackends--;
+        liveBackends = Math.max(0, liveBackends - 1);
         sessions.delete(sid);
         backend.close().catch(() => {});
         http.close().catch(() => {});

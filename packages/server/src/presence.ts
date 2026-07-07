@@ -30,6 +30,13 @@ export interface PresenceMonitor {
   on(ev: "up" | "down", cb: () => void): void;
   /** Actively probe the socket.  Resolves `true` iff a connection succeeds within 250 ms. */
   probeNow(): Promise<boolean>;
+  /**
+   * TEST SEAM — run exactly one internal poll cycle (probe + state-update + emit)
+   * and resolve when it completes.  Bypasses the interval timer and fs.watch so
+   * tests can trigger a controlled number of probes without timing uncertainty.
+   * @internal — only for use in __tests__/
+   */
+  _pollForTest(): Promise<void>;
 }
 
 // ── Factory ───────────────────────────────────────────────────────────────────
@@ -42,6 +49,7 @@ export function createPresenceMonitor(opts: {
   const emitter = new EventEmitter();
 
   let cached = false;
+  let consecutiveConnectFailures = 0;
   let timer: ReturnType<typeof setInterval> | null = null;
   let watcher: fs.FSWatcher | null = null;
 
@@ -81,9 +89,38 @@ export function createPresenceMonitor(opts: {
 
   async function poll(): Promise<void> {
     const live = await probeNow();
-    if (live !== cached) {
-      cached = live;
-      emitter.emit(live ? "up" : "down");
+    if (live) {
+      // Success: flip to live immediately, reset the failure counter.
+      consecutiveConnectFailures = 0;
+      if (!cached) {
+        cached = true;
+        emitter.emit("up");
+      }
+    } else {
+      // Failure: distinguish a definitive socket-gone close from a transient
+      // connect failure (timeout / zombie / momentary load spike).
+      //
+      // If the socket FILE is gone, Obsidian definitely unloaded the plugin →
+      // emit "down" on the very first failed probe (keep clean-close failover fast).
+      //
+      // If the file still exists but the connect failed, it could be a transient
+      // timeout under load → require 2 consecutive failures before emitting "down".
+      const socketFileExists = fs.existsSync(socketPath);
+      if (!socketFileExists) {
+        // Definitive: socket removed → immediate "down".
+        consecutiveConnectFailures = 0;
+        if (cached) {
+          cached = false;
+          emitter.emit("down");
+        }
+      } else {
+        // Ambiguous: connect failed but file is still present.
+        consecutiveConnectFailures++;
+        if (consecutiveConnectFailures >= 2 && cached) {
+          cached = false;
+          emitter.emit("down");
+        }
+      }
     }
   }
 
@@ -143,5 +180,6 @@ export function createPresenceMonitor(opts: {
       emitter.on(ev, cb);
     },
     probeNow,
+    _pollForTest: poll,
   };
 }
