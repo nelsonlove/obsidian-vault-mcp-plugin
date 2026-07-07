@@ -87,7 +87,7 @@ then in your plugin's `onload()`:
       }])
     );
 
-The SDK handles load order (registers now or on the `vault-mcp:ready` event), re-registration when vault-mcp reloads, and cleanup. Tools appear to new Claude Code sessions on their next connect; they are guarded by vault-mcp's read-only mode and path allowlist like built-ins.
+The SDK handles load order (registers now or on the `vault-mcp:ready` event), re-registration when vault-mcp reloads, and cleanup. Tools appear to new Claude Code sessions on their next connect. Safety guards that apply: read-only mode always applies (mutating external tools are blocked when read-only is on); the path allowlist scopes arguments under recognized path keys (path, from, to, paths, and a few others) — when an allowlist is active, mutating external tools whose args carry no recognized path key are blocked outright, since vault-mcp cannot scope the call. To pass the allowlist check, use a recognized path argument name or clear the allowlist.
 
 ## Repo
 
