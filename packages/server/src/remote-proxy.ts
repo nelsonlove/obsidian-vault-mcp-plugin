@@ -1,4 +1,4 @@
-import { randomUUID, timingSafeEqual } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import path from "node:path";
 import express, { type Request, type Response, type NextFunction } from "express";
@@ -9,9 +9,9 @@ import {
   loadAuthConfig,
   protectedResourceMetadata,
   prmPath,
-  bearerChallenge,
-  verifyBearer,
-  introspectToken,
+  createAuthGate,
+  isAllowlistActive,
+  isAllowAnyAuthenticated,
 } from "./auth.js";
 
 /**
@@ -48,7 +48,6 @@ import {
 const PORT = Number(process.env.PORT ?? 8787);
 const HOST = process.env.HOST ?? "127.0.0.1";
 const TOKEN = process.env.VAULT_MCP_TOKEN ?? "";
-const TOKEN_BUF = Buffer.from(TOKEN);
 const BRIDGE =
   process.env.VAULT_MCP_BRIDGE ??
   path.join(homedir(), ".claude", "vault-mcp", "bridge.mjs");
@@ -82,49 +81,10 @@ if (!TOKEN && !authConfig.enabled) {
   process.exit(1);
 }
 
-/** Extract the Bearer credential from a request, or null. */
-function bearerOf(req: Request): string | null {
-  const m = (req.header("authorization") ?? "").match(/^Bearer\s+(.+)$/i);
-  return m ? m[1] : null;
-}
-
-/** Compact-JWS shape (three base64url segments): distinguishes an OAuth JWT from the opaque static token. */
-const JWT_RE = /^[\w-]+\.[\w-]+\.[\w-]+$/;
-
-/** Constant-time static-token match. Length is checked first, so a long JWT on
- * the OAuth path isn't copied into a Buffer before being rejected. */
-function staticTokenMatches(tok: string): boolean {
-  if (!TOKEN || tok.length !== TOKEN_BUF.length) return false;
-  return timingSafeEqual(Buffer.from(tok), TOKEN_BUF);
-}
-
-/** Uniform JSON-RPC 401 (every /mcp rejection uses this envelope). */
-function send401(res: Response, wwwAuthenticate: string): void {
-  res
-    .status(401)
-    .set("WWW-Authenticate", wwwAuthenticate)
-    .json({ jsonrpc: "2.0", error: { code: -32001, message: "unauthorized" }, id: null });
-}
-
-const STATIC_CHALLENGE = 'Bearer realm="obsidian-vault-mcp"';
-
-// Per-user authorization allowlist. A valid OAuth token proves the caller
-// AUTHENTICATED with the AS — NOT that they're an authorized user. This is a
-// single-user server and the AS (e.g. Clerk) permits public sign-up, so a token
-// is accepted only if its `sub` (or a VERIFIED `email`) is allowlisted. The
-// static token path is exempt (it's the owner's own secret).
-const ALLOWED_SUBS = new Set((process.env.AUTH_ALLOWED_SUBS ?? "").split(/[\s,]+/).filter(Boolean));
-const ALLOWED_EMAILS = new Set(
-  (process.env.AUTH_ALLOWED_EMAILS ?? "").split(/[\s,]+/).filter(Boolean).map((e) => e.toLowerCase()),
-);
-const ALLOWLIST_ACTIVE = ALLOWED_SUBS.size > 0 || ALLOWED_EMAILS.size > 0;
 // Fail CLOSED: with OAuth on but no allowlist, EVERY valid token would be
 // accepted — on a public-sign-up AS that's an open vault. Refuse to start unless
 // an allowlist is set, or the operator explicitly opts into "any authenticated".
-const ALLOW_ANY = ["true", "1", "yes", "on"].includes(
-  (process.env.AUTH_ALLOW_ANY_AUTHENTICATED ?? "").trim().toLowerCase(),
-);
-if (authConfig.enabled && !ALLOWLIST_ACTIVE && !ALLOW_ANY) {
+if (authConfig.enabled && !isAllowlistActive() && !isAllowAnyAuthenticated()) {
   console.error(
     "[remote-proxy] refusing to start: AUTH_ENABLED=true with no AUTH_ALLOWED_SUBS / " +
       "AUTH_ALLOWED_EMAILS. A valid token would grant vault access to ANY user who can " +
@@ -134,89 +94,13 @@ if (authConfig.enabled && !ALLOWLIST_ACTIVE && !ALLOW_ANY) {
 }
 
 /**
- * Is this authenticated subject authorized? `sub` is the primary gate. `email`
- * is honored ONLY when the AS asserts it is verified (`email_verified === true`)
- * — an unverified email an attacker set to the owner's address must not pass.
- */
-function subjectAllowed(claims: { sub?: string; email?: unknown; email_verified?: unknown }): boolean {
-  if (!ALLOWLIST_ACTIVE) return true; // only reachable under AUTH_ALLOW_ANY (guarded at startup)
-  if (claims.sub && ALLOWED_SUBS.has(claims.sub)) return true;
-  if (
-    claims.email_verified === true &&
-    typeof claims.email === "string" &&
-    ALLOWED_EMAILS.has(claims.email.toLowerCase())
-  ) {
-    return true;
-  }
-  return false;
-}
-
-/** Valid token, but the authenticated user isn't allowlisted. */
-function send403(res: Response): void {
-  res
-    .status(403)
-    .json({ jsonrpc: "2.0", error: { code: -32003, message: "forbidden: user not authorized" }, id: null });
-}
-
-/**
  * Dual-auth gate for /mcp. Runs BEFORE the body parser (so unauthenticated
  * requests can't force a 10 MB parse) and reads only the Authorization header.
  *
- * Order: static owner token → allow (allowlist-exempt). Then, with OAuth on:
- * no token → AS-discovery 401; a non-JWT the length of the static token, or an
- * implausibly-sized one → local 401 (never introspected, so a mistyped secret
- * isn't leaked to the AS and garbage can't amplify). Otherwise AUTHENTICATE
- * (JWT via JWKS, else opaque via introspection bound to our client_id) then
- * AUTHORIZE via the per-user allowlist once — allow / 401 / 403.
+ * Delegates to createAuthGate in auth.ts (moved there so the unified front can
+ * reuse the same gate for both plugin-proxy and future local modes).
  */
-type AuthClaims = { sub?: string; email?: unknown; email_verified?: unknown };
-
-async function authGateImpl(req: Request, res: Response, next: NextFunction): Promise<void> {
-  const tok = bearerOf(req);
-  if (process.env.VAULT_MCP_DEBUG_AUTH) {
-    const shape = !tok ? "none" : JWT_RE.test(tok) ? "jwt" : `opaque(len=${tok.length})`;
-    console.error(`[remote-proxy] auth-debug: ${req.method} bearer=${shape}`);
-  }
-  // Static owner token — the owner's own secret; exempt from the OAuth allowlist.
-  if (tok && staticTokenMatches(tok)) return next();
-
-  if (!authConfig.enabled) return send401(res, STATIC_CHALLENGE);
-
-  // No credential → advertise the AS so a web client can discover + authenticate.
-  if (!tok) return send401(res, bearerChallenge(authConfig, "invalid_request", "authentication required"));
-
-  if (!JWT_RE.test(tok)) {
-    // A non-JWT bearer the length of the static token is almost certainly a
-    // mistyped VAULT_MCP_TOKEN → reject locally: don't ship the secret to the AS
-    // introspection endpoint, and don't push a Claude Code client into OAuth.
-    if (TOKEN && tok.length === TOKEN_BUF.length) return send401(res, STATIC_CHALLENGE);
-    // Implausible length → reject locally so garbage can't amplify into a flood
-    // of outbound introspection POSTs against the AS.
-    if (tok.length < 16 || tok.length > 4096) {
-      return send401(res, bearerChallenge(authConfig, "invalid_token", "token rejected"));
-    }
-  }
-
-  // AUTHENTICATE: JWT via JWKS (issuer + audience), else opaque via RFC 7662
-  // introspection (bound to our client_id). Both return claims or null.
-  const claims: AuthClaims | null = JWT_RE.test(tok)
-    ? await verifyBearer(authConfig, tok)
-    : ((await introspectToken(tok)) as AuthClaims | null);
-
-  if (process.env.VAULT_MCP_DEBUG_AUTH) {
-    console.error(`[remote-proxy] auth-debug: authn ${claims ? "ok" : "rejected"} sub=${claims?.sub}`);
-  }
-  if (!claims) return send401(res, bearerChallenge(authConfig, "invalid_token", "token rejected"));
-
-  // AUTHORIZE: one allowlist check for both token types.
-  if (!subjectAllowed(claims)) return send403(res);
-  return next();
-}
-
-/** Express wrapper so any rejection reaches the error handler instead of floating. */
-function authGate(req: Request, res: Response, next: NextFunction): void {
-  authGateImpl(req, res, next).catch(next);
-}
+const authGate = createAuthGate(authConfig, { token: TOKEN });
 
 /** True if a JSON-RPC body (single or batch) contains an `initialize` request. */
 function isInitialize(body: unknown): boolean {
