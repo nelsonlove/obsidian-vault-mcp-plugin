@@ -3,13 +3,12 @@
   "version": "1.0.0",
   "description": "Minimal remote (Streamable HTTP) MCP server exposing an Obsidian vault folder for read/search/write.",
   "type": "module",
-  "main": "dist/index.js",
+  "main": "dist/front.js",
   "scripts": {
     "build": "tsc",
-    "start": "node dist/index.js",
+    "start": "node dist/front.js",
     "dev": "tsc --watch",
-    "test": "tsc && node --test 'dist/__tests__/*.test.js'",
-    "start:proxy": "node dist/remote-proxy.js"
+    "test": "tsc && node --test 'dist/__tests__/*.test.js'"
   },
   "dependencies": {
     "@vault-mcp/core": "*",

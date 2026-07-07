@@ -1,4 +1,5 @@
-import type { Request, Response, NextFunction } from "express";
+import { timingSafeEqual } from "node:crypto";
+import type { Request, Response, NextFunction, RequestHandler } from "express";
 import { createRemoteJWKSet, jwtVerify, type JWTPayload } from "jose";
 
 /**
@@ -183,13 +184,156 @@ export async function introspectToken(token: string): Promise<Record<string, unk
     if (process.env.VAULT_MCP_DEBUG_AUTH) {
       // No token material or PII (email) — just enough to diagnose auth outcomes.
       console.error(
-        `[remote-proxy] introspect-debug: status=${res.status} active=${data.active} client_ok=${data.client_id === cid} sub=${data.sub}`,
+        `[front] introspect-debug: status=${res.status} active=${data.active} client_ok=${data.client_id === cid} sub=${data.sub}`,
       );
     }
     if (!res.ok) return null;
     return ok ? data : null;
   } catch (e) {
-    if (process.env.VAULT_MCP_DEBUG_AUTH) console.error("[remote-proxy] introspect-debug: fetch failed", e);
+    if (process.env.VAULT_MCP_DEBUG_AUTH) console.error("[front] introspect-debug: fetch failed", e);
     return null;
   }
+}
+
+// ── Auth gate helpers ─────────────────────────────────────────────────────────
+
+/** Compact-JWS shape (three base64url segments): distinguishes an OAuth JWT from an opaque token. */
+const JWT_RE = /^[\w-]+\.[\w-]+\.[\w-]+$/;
+
+/** Bearer realm for static-token 401 rejections. */
+export const STATIC_CHALLENGE = 'Bearer realm="obsidian-vault-mcp"';
+
+/** Extract the Bearer credential from a request, or null. */
+function bearerOf(req: Request): string | null {
+  const m = (req.header("authorization") ?? "").match(/^Bearer\s+(.+)$/i);
+  return m ? m[1] : null;
+}
+
+/** Uniform JSON-RPC 401 envelope for MCP endpoint rejections. */
+function send401(res: Response, wwwAuthenticate: string): void {
+  res
+    .status(401)
+    .set("WWW-Authenticate", wwwAuthenticate)
+    .json({ jsonrpc: "2.0", error: { code: -32001, message: "unauthorized" }, id: null });
+}
+
+/** Valid token, but the authenticated user isn't allowlisted. */
+function send403(res: Response): void {
+  res
+    .status(403)
+    .json({ jsonrpc: "2.0", error: { code: -32003, message: "forbidden: user not authorized" }, id: null });
+}
+
+/**
+ * True if at least one entry is present in AUTH_ALLOWED_SUBS or AUTH_ALLOWED_EMAILS.
+ * Read from process.env at call time so entrypoints can check after startup.
+ */
+export function isAllowlistActive(): boolean {
+  const subs = (process.env.AUTH_ALLOWED_SUBS ?? "").split(/[\s,]+/).filter(Boolean);
+  const emails = (process.env.AUTH_ALLOWED_EMAILS ?? "").split(/[\s,]+/).filter(Boolean);
+  return subs.length > 0 || emails.length > 0;
+}
+
+/** True if AUTH_ALLOW_ANY_AUTHENTICATED is set to a truthy value. */
+export function isAllowAnyAuthenticated(): boolean {
+  return ["true", "1", "yes", "on"].includes(
+    (process.env.AUTH_ALLOW_ANY_AUTHENTICATED ?? "").trim().toLowerCase(),
+  );
+}
+
+type AuthClaims = { sub?: string; email?: unknown; email_verified?: unknown };
+
+/**
+ * Dual-auth gate factory. Returns an Express middleware that accepts requests with:
+ *   (a) the static owner token (opts.token, allowlist-exempt), OR
+ *   (b) a valid OAuth 2.1 Bearer credential bound to this resource (cfg.enabled).
+ *
+ * Reads AUTH_ALLOWED_SUBS / AUTH_ALLOWED_EMAILS from process.env at creation time
+ * so tests can set them before calling createAuthGate. Does NOT call process.exit —
+ * fail-closed startup checks belong in the entrypoint.
+ *
+ * Mount BEFORE body-parsing middleware; the gate reads only the Authorization header
+ * so unauthenticated callers cannot force a JSON parse.
+ */
+export function createAuthGate(cfg: AuthConfig, opts: { token?: string }): RequestHandler {
+  const TOKEN = opts.token ?? "";
+  const TOKEN_BUF = Buffer.from(TOKEN);
+
+  // Capture allowlist from env at gate creation time.
+  const allowedSubs = new Set(
+    (process.env.AUTH_ALLOWED_SUBS ?? "").split(/[\s,]+/).filter(Boolean),
+  );
+  const allowedEmails = new Set(
+    (process.env.AUTH_ALLOWED_EMAILS ?? "")
+      .split(/[\s,]+/)
+      .filter(Boolean)
+      .map((e) => e.toLowerCase()),
+  );
+  const allowlistActive = allowedSubs.size > 0 || allowedEmails.size > 0;
+
+  /**
+   * Is this authenticated subject authorized? `sub` is the primary gate. `email`
+   * is honored ONLY when the AS asserts it is verified (`email_verified === true`)
+   * — an unverified email an attacker set to the owner's address must not pass.
+   */
+  function subjectAllowed(claims: AuthClaims): boolean {
+    if (!allowlistActive) return true; // only reachable under AUTH_ALLOW_ANY (guarded at startup)
+    if (claims.sub && allowedSubs.has(claims.sub)) return true;
+    if (
+      claims.email_verified === true &&
+      typeof claims.email === "string" &&
+      allowedEmails.has(claims.email.toLowerCase())
+    ) {
+      return true;
+    }
+    return false;
+  }
+
+  async function impl(req: Request, res: Response, next: NextFunction): Promise<void> {
+    const tok = bearerOf(req);
+    if (process.env.VAULT_MCP_DEBUG_AUTH) {
+      const shape = !tok ? "none" : JWT_RE.test(tok) ? "jwt" : `opaque(len=${tok.length})`;
+      console.error(`[front] auth-debug: ${req.method} bearer=${shape}`);
+    }
+    // Static owner token — the owner's own secret; exempt from the OAuth allowlist.
+    if (tok && TOKEN && tok.length === TOKEN_BUF.length && timingSafeEqual(Buffer.from(tok), TOKEN_BUF)) {
+      return next();
+    }
+
+    if (!cfg.enabled) return send401(res, STATIC_CHALLENGE);
+
+    // No credential → advertise the AS so a web client can discover + authenticate.
+    if (!tok) return send401(res, bearerChallenge(cfg, "invalid_request", "authentication required"));
+
+    if (!JWT_RE.test(tok)) {
+      // A non-JWT bearer the length of the static token is almost certainly a
+      // mistyped VAULT_MCP_TOKEN → reject locally: don't ship the secret to the AS
+      // introspection endpoint, and don't push a Claude Code client into OAuth.
+      if (TOKEN && tok.length === TOKEN_BUF.length) return send401(res, STATIC_CHALLENGE);
+      // Implausible length → reject locally so garbage can't amplify into a flood
+      // of outbound introspection POSTs against the AS.
+      if (tok.length < 16 || tok.length > 4096) {
+        return send401(res, bearerChallenge(cfg, "invalid_token", "token rejected"));
+      }
+    }
+
+    // AUTHENTICATE: JWT via JWKS (issuer + audience), else opaque via RFC 7662
+    // introspection (bound to our client_id). Both return claims or null.
+    const claims: AuthClaims | null = JWT_RE.test(tok)
+      ? await verifyBearer(cfg, tok)
+      : ((await introspectToken(tok)) as AuthClaims | null);
+
+    if (process.env.VAULT_MCP_DEBUG_AUTH) {
+      console.error(`[front] auth-debug: authn ${claims ? "ok" : "rejected"} sub=${claims?.sub}`);
+    }
+    if (!claims) return send401(res, bearerChallenge(cfg, "invalid_token", "token rejected"));
+
+    // AUTHORIZE: one allowlist check for both token types.
+    if (!subjectAllowed(claims)) return send403(res);
+    return next();
+  }
+
+  return (req: Request, res: Response, next: NextFunction): void => {
+    impl(req, res, next).catch(next);
+  };
 }
