@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  LaunchAgent for the plugin-backed remote MCP proxy (src/remote-proxy.ts).
+
+  Install:
+    cp deploy/com.nelson.vault-mcp-remote.plist.template \
+       ~/Library/LaunchAgents/com.nelson.vault-mcp-remote.plist
+    # edit paths below if your repo/node live elsewhere
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.nelson.vault-mcp-remote.plist
+    launchctl kickstart -k gui/$(id -u)/com.nelson.vault-mcp-remote
+
+  The Bearer token and PORT come from ~/.config/vault-mcp-remote/env (chmod 600),
+  which is sourced at launch — the secret never lives in this plist or in git.
+  That env file must define at least:  VAULT_MCP_TOKEN=<random-hex>
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.nelson.vault-mcp-remote</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/sh</string>
+    <string>-c</string>
+    <string>set -a; . "$HOME/.config/vault-mcp-remote/env"; exec /opt/homebrew/bin/node /Users/nelson/repos/obsidian-vault-mcp-server/dist/remote-proxy.js</string>
+  </array>
+
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+
+  <key>StandardOutPath</key>
+  <string>/Users/nelson/.local/state/vault-mcp-remote/proxy.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/nelson/.local/state/vault-mcp-remote/proxy.log</string>
+</dict>
+</plist>
