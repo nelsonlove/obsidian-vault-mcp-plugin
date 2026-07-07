@@ -8,6 +8,7 @@
 
 import { TFile, TFolder, getAllTags, type App } from "obsidian";
 import { CHARACTER_LIMIT } from "@vault-mcp/core";
+import { backlinkKeys } from "./helpers.js";
 import type {
   VaultBackend,
   NoteRef,
@@ -210,8 +211,10 @@ export class ObsidianBackend implements VaultBackend {
     const file = this.app.vault.getAbstractFileByPath(notePath);
     if (!file) throw new Error(`not found: ${notePath}`);
     // getBacklinksForFile is not in the public obsidian types — cast required.
+    // .data can be a Map (most Obsidian builds) or a plain object (some older
+    // builds) — backlinkKeys handles both shapes defensively.
     const bl = (this.app.metadataCache as any).getBacklinksForFile(file);
-    return bl?.data ? Array.from<string>(bl.data.keys()) : [];
+    return backlinkKeys(bl?.data);
   }
 
   async getOutlinks(notePath: string): Promise<OutlinkEntry[]> {

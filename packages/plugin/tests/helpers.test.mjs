@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { validateMoves, okError } from "../src/mcp/helpers.ts";
+import { validateMoves, okError, backlinkKeys } from "../src/mcp/helpers.ts";
 
 test("validateMoves allows disjoint moves", () => {
   const result = validateMoves([
@@ -89,4 +89,30 @@ test("okError carries ok()'s shape plus the MCP error flag", () => {
   assert.equal(result.isError, true);
   assert.deepEqual(result.structuredContent, { count: 0 });
   assert.ok(result.content[0].text.includes('"count": 0'));
+});
+
+// =============================================================================
+// Issue #29 — backlinkKeys handles both Map and plain-object shapes
+// =============================================================================
+
+test("#29 backlinkKeys: Map-shaped data returns key list", () => {
+  const m = new Map([["a.md", {}], ["b.md", {}]]);
+  assert.deepEqual(new Set(backlinkKeys(m)), new Set(["a.md", "b.md"]));
+});
+
+test("#29 backlinkKeys: plain-object data returns Object.keys list", () => {
+  const obj = { "a.md": {}, "b.md": {} };
+  assert.deepEqual(new Set(backlinkKeys(obj)), new Set(["a.md", "b.md"]));
+});
+
+test("#29 backlinkKeys: null / undefined returns empty array", () => {
+  assert.deepEqual(backlinkKeys(null), []);
+  assert.deepEqual(backlinkKeys(undefined), []);
+});
+
+test("#29 backlinkKeys: Map and object with same keys produce identical results", () => {
+  const keys = ["Foo/A.md", "Bar/B.md", "C.md"];
+  const m = new Map(keys.map((k) => [k, {}]));
+  const o = Object.fromEntries(keys.map((k) => [k, {}]));
+  assert.deepEqual(backlinkKeys(m).sort(), backlinkKeys(o).sort());
 });
