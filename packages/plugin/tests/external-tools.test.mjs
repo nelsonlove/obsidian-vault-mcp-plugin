@@ -57,3 +57,9 @@ test("unregisterTools drops all of an owner's tools by raw id", () => {
   reg.unregisterTools("jd-survey");
   assert.deepEqual(reg.entries().map((e) => e.toolName), ["other_c"]);
 });
+
+test("registration is atomic: a mid-array validation failure registers nothing", () => {
+  const reg = new ExternalToolRegistry();
+  assert.throws(() => reg.registerTools("p", [spec("valid_tool"), spec("Bad-Name")]), TypeError);
+  assert.equal(reg.entries().length, 0);
+});

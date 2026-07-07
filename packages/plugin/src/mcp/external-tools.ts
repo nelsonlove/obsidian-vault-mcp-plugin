@@ -37,12 +37,16 @@ export class ExternalToolRegistry {
   registerTools(ownerPluginId: string, tools: ExternalToolSpec[]): () => void {
     const owner = sanitizeOwnerId(ownerPluginId);
     if (!owner) throw new TypeError(`vault-mcp: unusable owner plugin id '${ownerPluginId}'`);
-    const added: ExternalToolEntry[] = [];
+    // Validate everything before inserting anything — a mid-array failure
+    // must not leave earlier specs registered with no disposer.
     for (const spec of tools) {
       if (!NAME_RE.test(spec.name))
         throw new TypeError(`vault-mcp: invalid tool name '${spec.name}' (must match ${NAME_RE})`);
       if (typeof spec.handler !== "function")
         throw new TypeError(`vault-mcp: tool '${spec.name}' handler is not a function`);
+    }
+    const added: ExternalToolEntry[] = [];
+    for (const spec of tools) {
       const entry: ExternalToolEntry = { ownerId: ownerPluginId, toolName: `${owner}_${spec.name}`, spec };
       this.byName.set(entry.toolName, entry); // replace-on-re-register, by design
       added.push(entry);
