@@ -181,7 +181,7 @@ export const FS_TOOLS: ToolDef[] = [
     description:
       "Find notes whose frontmatter has `property == value`. Property match is case-insensitive (Obsidian convention); value match is case-sensitive (exact). " +
       "For array-typed fields (`tags`, `aliases`, etc.) the note matches if any array element equals the value. " +
-      "Backed by the in-memory index, which auto-refreshes on disk changes within ~300ms; call `obsidian_force_reindex` if you need to wait synchronously before querying. Read-only.",
+      "Backed by the vault index; call `obsidian_force_reindex` if you need a synchronous index refresh before querying. Read-only.",
     inputSchema: {
       property: z
         .string()
@@ -208,7 +208,8 @@ export const FS_TOOLS: ToolDef[] = [
       "Resolve one or more references (wikilinks, basenames, aliases, JD-IDs, or vault-relative paths) to canonical vault paths. " +
       "Algorithm matches Obsidian's: exact path → JD-ID → basename → frontmatter alias. " +
       "Accepts `[[...]]` wrapping, `|alias` display text, and `#heading` / `#^block` fragments — those are stripped for matching and preserved in the response. " +
-      "Multiple basename or alias matches return as `ambiguous` with all candidates so the caller can disambiguate. Read-only.",
+      "Multiple basename or alias matches return as `ambiguous` with all candidates so the caller can disambiguate. " +
+      "The optional `from` field provides context for relative-link disambiguation; it is backend-dependent (honored by the live Obsidian backend, ignored by the filesystem backend). Read-only.",
     inputSchema: {
       refs: z
         .array(z.string().min(1))
@@ -216,6 +217,12 @@ export const FS_TOOLS: ToolDef[] = [
         .max(100)
         .describe(
           "References to resolve, e.g. ['Daily Standup', '[[92.05]]', 'Projects/A.md#Goals']."
+        ),
+      from: z
+        .string()
+        .optional()
+        .describe(
+          "Optional vault-relative path of the note containing the references (context for relative-link disambiguation). Best-effort: honored by the live Obsidian backend, ignored by the filesystem backend for now."
         ),
     },
     annotations: RO,
@@ -226,7 +233,7 @@ export const FS_TOOLS: ToolDef[] = [
     name: "obsidian_get_backlinks",
     title: "Get backlinks to a note",
     description:
-      "List notes that contain a `[[wikilink]]` pointing at the given note. Backlinks are computed from the in-memory index, which auto-refreshes on disk changes within ~300ms; call `obsidian_force_reindex` if you need to wait synchronously before querying. Read-only.",
+      "List notes that contain a `[[wikilink]]` pointing at the given note. Backlinks are resolved from the vault index; call `obsidian_force_reindex` if you need a synchronous index refresh before querying. Read-only.",
     inputSchema: {
       path: z
         .string()
@@ -256,14 +263,13 @@ export const FS_TOOLS: ToolDef[] = [
 
   {
     name: "obsidian_force_reindex",
-    title: "Force-rebuild the in-memory vault index",
+    title: "Force-rebuild the vault index",
     description:
-      "Re-walk the vault from disk and rebuild the in-memory index (basename / alias / JD-ID / frontmatter / backlinks). " +
-      "Normally unnecessary — the watcher refreshes the index within ~300ms of any disk change. Call this when you need to wait synchronously before a follow-up query (tight read-after-write loop), or when you suspect the watcher missed an event. " +
-      "Bounded by the disk walk: ~5–10s cold on spinning disk, sub-second with a warm pagecache. Concurrent callers share a single in-flight rebuild. " +
-      "Reads served during the rebuild see the previous ready index — there's no zero-count window. Idempotent.",
+      "Rebuilds the vault index on backends that maintain one; a no-op on backends whose cache is always live. " +
+      "Call this when you need to wait synchronously before a follow-up index query (tight read-after-write loop). " +
+      "Concurrent callers share a single in-flight rebuild where supported. Idempotent.",
     inputSchema: {},
-    // Not read-only (mutates in-memory index), but idempotent.
+    // Not read-only (mutates the index), but idempotent.
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     capability: "fs-expressible",
   },
@@ -277,7 +283,7 @@ export const FS_TOOLS: ToolDef[] = [
       "Read or modify one top-level frontmatter field of a note. Supports inline-scalar (`key: value`), inline-array (`key: [a, b]`), and block-array (`key:\\n  - a`) shapes. " +
       "Refuses to edit fields using block-scalar (|/>) or inline-object shapes to avoid silent corruption. " +
       "`set` creates the frontmatter block if absent. Other keys' formatting (indentation, quoting) is preserved — only the target key's lines get rewritten. " +
-      "Note: changes are written to disk live, and the watcher auto-refreshes the in-memory index within ~300ms. Tight read-after-write loops should call obsidian_force_reindex first to wait synchronously.",
+      "Note: changes are applied live. Call `obsidian_force_reindex` before follow-up index queries if you need a synchronous index refresh.",
     inputSchema: {
       path: z.string().min(1).describe("Vault-relative path of the note, ending in .md."),
       key: z
@@ -357,10 +363,10 @@ export const FS_TOOLS: ToolDef[] = [
     title: "Rename / move a note and rewrite backlinks",
     description:
       "Move (or rename) a note from one vault path to another. With `update_backlinks: true` (default), every note that wikilinks to `from` is rewritten to point at `to`. " +
-      "Resolution uses the in-memory index built at startup: only refs that currently resolve to `from` are touched; ambiguous basename matches are left alone (the index can't tell which note the author meant). " +
+      "Resolution uses the vault index: only refs that currently resolve to `from` are touched; ambiguous basename matches are left alone. " +
       "Ref *shape* is preserved across the rewrite — bare basename refs (`[[from-basename]]`) get the new basename, full-path refs get the new full path. `|alias` and `#fragment` suffixes are kept verbatim. " +
       "Refuses if `to` already exists unless `overwrite: true`. Parent folders of `to` are created as needed. " +
-      "The watcher refreshes the in-memory index within ~300ms after the move; tight read-after-write loops should call `obsidian_force_reindex` first to wait synchronously.",
+      "Call `obsidian_force_reindex` after the move if downstream queries need a synchronous index refresh.",
     inputSchema: {
       from: z.string().min(1).describe("Existing vault-relative path of the note, ending in .md."),
       to: z.string().min(1).describe("New vault-relative path, ending in .md."),
@@ -381,7 +387,7 @@ export const FS_TOOLS: ToolDef[] = [
     name: "obsidian_delete_note",
     title: "Delete a note from the vault",
     description:
-      "Permanently delete a note from disk. The change propagates to your other devices via Obsidian Sync — the same one-way deletion that caused a near-data-loss incident on 2026-06-04 if used wrong. " +
+      "Permanently delete a note from disk. The change propagates to your other devices via Obsidian Sync — this is a one-way operation with no undo. " +
       "To make accidents harder: `confirm: true` is required at the schema layer. Calls without it are rejected before reaching the filesystem. " +
       "Backlinks to the deleted note are NOT updated — those refs become 'broken' and can be detected with the existing tooling. Use `obsidian_move_note` if you want to relocate while preserving wikilinks.",
     inputSchema: {

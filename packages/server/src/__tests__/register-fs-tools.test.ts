@@ -205,7 +205,7 @@ describe("registerFsTools", () => {
     const { client, teardown } = await makeClientServer(backend);
     try {
       const { tools } = await client.listTools();
-      // Spot-check obsidian_resolve has `refs` (array) not `ref` (single)
+      // Spot-check obsidian_resolve has `refs` (array) not `ref` (single), plus optional `from`
       const resolve = tools.find((t) => t.name === "obsidian_resolve");
       assert.ok(resolve, "obsidian_resolve not found");
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -213,6 +213,10 @@ describe("registerFsTools", () => {
       assert.ok(schema.properties?.refs, "obsidian_resolve should have `refs` array field");
       assert.equal(schema.properties.refs.type, "array", "refs should be array type");
       assert.ok(!schema.properties?.ref, "obsidian_resolve should NOT have single `ref` field");
+      assert.ok(schema.properties?.from !== undefined, "obsidian_resolve should have optional `from` field");
+      // `from` should NOT be in required (it's optional)
+      const required: string[] = schema.required ?? [];
+      assert.ok(!required.includes("from"), "`from` should be optional (not in required array)");
 
       // Spot-check obsidian_move_note has update_backlinks
       const move = tools.find((t) => t.name === "obsidian_move_note");

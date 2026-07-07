@@ -67,3 +67,28 @@ test("SHARED_ANNOTATIONS.RO has readOnlyHint=true", () => {
 test("SHARED_ANNOTATIONS.DESTRUCTIVE has destructiveHint=true", () => {
   assert.equal(SHARED_ANNOTATIONS.DESTRUCTIVE.destructiveHint, true);
 });
+
+test("obsidian_resolve has both `refs` (array) and optional `from` in inputSchema", () => {
+  const tool = FS_TOOLS.find((t) => t.name === "obsidian_resolve");
+  assert.ok(tool, "obsidian_resolve not found in FS_TOOLS");
+  assert.ok(tool.inputSchema.refs, "obsidian_resolve should have `refs` field");
+  assert.ok(tool.inputSchema.from, "obsidian_resolve should have optional `from` field");
+});
+
+test("obsidian_patch_note, obsidian_write_note, obsidian_move_note have DESTRUCTIVE annotations", () => {
+  for (const name of ["obsidian_patch_note", "obsidian_write_note", "obsidian_move_note"]) {
+    const tool = FS_TOOLS.find((t) => t.name === name);
+    assert.ok(tool, `${name} not found in FS_TOOLS`);
+    assert.equal(tool.annotations.destructiveHint, true, `${name} should have destructiveHint=true`);
+    assert.equal(tool.annotations.readOnlyHint, false, `${name} should have readOnlyHint=false`);
+  }
+});
+
+test("obsidian_force_reindex has readOnlyHint=false, destructiveHint=false, idempotentHint=true", () => {
+  const tool = FS_TOOLS.find((t) => t.name === "obsidian_force_reindex");
+  assert.ok(tool, "obsidian_force_reindex not found in FS_TOOLS");
+  assert.equal(tool.annotations.readOnlyHint, false);
+  assert.equal(tool.annotations.destructiveHint, false);
+  assert.equal(tool.annotations.idempotentHint, true);
+  assert.equal(tool.annotations.openWorldHint, false);
+});

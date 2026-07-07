@@ -221,7 +221,11 @@ function makeHandler(
 
     // ── obsidian_resolve ───────────────────────────────────────────────────
     case "obsidian_resolve":
-      return async ({ refs }: { refs: string[] }) => {
+      return async ({ refs, from: _from }: { refs: string[]; from?: string }) => {
+        // `from` (context for relative-link disambiguation) is accepted by the schema
+        // but not forwarded to the FS backend — folder-relative resolution is a
+        // documented follow-up. Graceful degradation: the FS backend resolves refs
+        // without source-note context.
         try {
           const decoded = refs.map(dec);
           const results = await backend.resolve(decoded);
