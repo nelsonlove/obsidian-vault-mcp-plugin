@@ -6,6 +6,7 @@ import { vaultSlug, socketPath, stateDir, bridgeDestPath } from "./paths.js";
 import { writeDiscovery, removeDiscovery, writeBridge, type Discovery } from "./discovery.js";
 import { ConnectionSetupModal, VaultMcpSettingTab } from "./connection-ui.js";
 import { findClaudeBinary, claudeIsRegistered, claudeRegister, claudeRemove } from "./claude-cli.js";
+import { ExternalToolRegistry, type VaultMcpApi } from "./mcp/external-tools.js";
 
 interface VaultMcpSettings { setupAcknowledged: boolean; readOnly: boolean; allowlist: string[]; enabled: boolean; }
 const DEFAULT_SETTINGS: VaultMcpSettings = { setupAcknowledged: false, readOnly: false, allowlist: [], enabled: true };
@@ -23,6 +24,13 @@ export default class VaultMcpPlugin extends Plugin {
   private listener: UnixSocketListener | null = null;
   private slug = "";
   declare settings: VaultMcpSettings;
+  private externalRegistry = new ExternalToolRegistry();
+  // Public plugin-to-plugin API: app.plugins.plugins['vault-mcp'].api
+  api: VaultMcpApi = {
+    apiVersion: 1,
+    registerTools: (owner, tools) => this.externalRegistry.registerTools(owner, tools),
+    unregisterTools: (owner) => this.externalRegistry.unregisterTools(owner),
+  };
 
   async loadSettings() { this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData()); }
   async saveSettings() { await this.saveData(this.settings); }
@@ -87,6 +95,7 @@ export default class VaultMcpPlugin extends Plugin {
       vaultName,
       enabledPlugins: () => Array.from((this.app as any).plugins.enabledPlugins as Set<string>),
       getSettings: () => ({ readOnly: this.settings.readOnly, allowlist: this.settings.allowlist }),
+      getExternalTools: () => this.externalRegistry.entries(),
     };
 
     if (this.settings.enabled) {
@@ -137,6 +146,9 @@ export default class VaultMcpPlugin extends Plugin {
         ]).open();
       },
     });
+
+    // Signal publishers (vault-mcp-api SDK) that the api is (re-)available.
+    this.app.workspace.trigger("vault-mcp:ready", this.api);
   }
 
   async onunload() {
