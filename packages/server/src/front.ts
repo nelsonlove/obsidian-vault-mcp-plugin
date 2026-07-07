@@ -186,7 +186,9 @@ if (process.argv[1] && path.resolve(process.argv[1]) === _thisFile) {
   const BRIDGE =
     process.env.VAULT_MCP_BRIDGE ??
     path.join(homedir(), ".claude", "vault-mcp", "bridge.mjs");
-  // Reap sessions idle longer than this. See remote-proxy.ts for rationale.
+  // Reap sessions idle longer than this. 30 min is generous enough to avoid tearing
+  // down a live-but-idle session mid-conversation; clients re-initialize on the
+  // next 404 if the session was reaped. Tune via VAULT_MCP_IDLE_MS.
   const IDLE_MS = Number(process.env.VAULT_MCP_IDLE_MS ?? 30 * 60 * 1000);
   // Hard cap on concurrent bridge.mjs backends to prevent process floods.
   const MAX_SESSIONS = Number(process.env.VAULT_MCP_MAX_SESSIONS ?? 32);

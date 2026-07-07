@@ -184,18 +184,18 @@ export async function introspectToken(token: string): Promise<Record<string, unk
     if (process.env.VAULT_MCP_DEBUG_AUTH) {
       // No token material or PII (email) — just enough to diagnose auth outcomes.
       console.error(
-        `[remote-proxy] introspect-debug: status=${res.status} active=${data.active} client_ok=${data.client_id === cid} sub=${data.sub}`,
+        `[front] introspect-debug: status=${res.status} active=${data.active} client_ok=${data.client_id === cid} sub=${data.sub}`,
       );
     }
     if (!res.ok) return null;
     return ok ? data : null;
   } catch (e) {
-    if (process.env.VAULT_MCP_DEBUG_AUTH) console.error("[remote-proxy] introspect-debug: fetch failed", e);
+    if (process.env.VAULT_MCP_DEBUG_AUTH) console.error("[front] introspect-debug: fetch failed", e);
     return null;
   }
 }
 
-// ── Auth gate helpers (moved from remote-proxy.ts) ────────────────────────────
+// ── Auth gate helpers ─────────────────────────────────────────────────────────
 
 /** Compact-JWS shape (three base64url segments): distinguishes an OAuth JWT from an opaque token. */
 const JWT_RE = /^[\w-]+\.[\w-]+\.[\w-]+$/;
@@ -293,7 +293,7 @@ export function createAuthGate(cfg: AuthConfig, opts: { token?: string }): Reque
     const tok = bearerOf(req);
     if (process.env.VAULT_MCP_DEBUG_AUTH) {
       const shape = !tok ? "none" : JWT_RE.test(tok) ? "jwt" : `opaque(len=${tok.length})`;
-      console.error(`[remote-proxy] auth-debug: ${req.method} bearer=${shape}`);
+      console.error(`[front] auth-debug: ${req.method} bearer=${shape}`);
     }
     // Static owner token — the owner's own secret; exempt from the OAuth allowlist.
     if (tok && TOKEN && tok.length === TOKEN_BUF.length && timingSafeEqual(Buffer.from(tok), TOKEN_BUF)) {
@@ -324,7 +324,7 @@ export function createAuthGate(cfg: AuthConfig, opts: { token?: string }): Reque
       : ((await introspectToken(tok)) as AuthClaims | null);
 
     if (process.env.VAULT_MCP_DEBUG_AUTH) {
-      console.error(`[remote-proxy] auth-debug: authn ${claims ? "ok" : "rejected"} sub=${claims?.sub}`);
+      console.error(`[front] auth-debug: authn ${claims ? "ok" : "rejected"} sub=${claims?.sub}`);
     }
     if (!claims) return send401(res, bearerChallenge(cfg, "invalid_token", "token rejected"));
 
