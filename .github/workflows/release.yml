@@ -32,7 +32,7 @@ jobs:
       - name: Verify tag matches manifest version
         run: |
           tag="${GITHUB_REF#refs/tags/}"
-          manifest_version="$(node -p "require('./manifest.json').version")"
+          manifest_version="$(node -p "require('./packages/plugin/manifest.json').version")"
           if [ "$tag" != "$manifest_version" ]; then
             echo "::error::Tag '$tag' does not match manifest version '$manifest_version'."
             exit 1
@@ -42,7 +42,7 @@ jobs:
         run: npm test
 
       - name: Build
-        run: npm run build
+        run: npm run build --workspace=packages/plugin
 
       - name: Create release with plugin assets
         env:
@@ -51,8 +51,8 @@ jobs:
           tag="${GITHUB_REF#refs/tags/}"
           # Obsidian/BRAT require manifest.json + main.js as individual assets
           # (never zipped). styles.css is included only if the plugin ships one.
-          assets="manifest.json main.js"
-          [ -f styles.css ] && assets="$assets styles.css"
+          assets="packages/plugin/manifest.json packages/plugin/main.js"
+          [ -f packages/plugin/styles.css ] && assets="$assets packages/plugin/styles.css"
           gh release create "$tag" \
             --title "$tag" \
             --notes "Release $tag" \

@@ -1,0 +1,17 @@
+# Node
+node_modules/
+dist/
+*.log
+npm-debug.log*
+
+# Nix
+result
+result-*
+.direnv/
+
+# Local env
+.env
+.env.local
+
+# macOS
+.DS_Store
