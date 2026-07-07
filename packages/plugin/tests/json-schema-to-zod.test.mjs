@@ -55,3 +55,38 @@ test("unknown/exotic types degrade to accept-anything, never throw", () => {
   assert.equal(shape.weird.safeParse({ a: 1 }).success, true);
   assert.equal(shape.mystery.safeParse("anything").success, true);
 });
+
+// ── F2: robustness against malformed / dangerous schemas ──────────────────
+
+test("F2: null property value degrades to accept-anything (z.unknown)", () => {
+  const shape = jsonSchemaToZodShape({
+    type: "object",
+    properties: { a: null },
+    required: ["a"],
+  });
+  assert.equal(shape.a.safeParse("anything").success, true);
+  assert.equal(shape.a.safeParse(null).success, true);
+  assert.equal(shape.a.safeParse(undefined).success, true);
+});
+
+test("F2: cyclic items (items === self) returns without throwing", () => {
+  const a = { type: "array" };
+  a.items = a; // cyclic
+  const schema = { type: "object", properties: { arr: a }, required: ["arr"] };
+  // Must not throw / stack-overflow regardless of result shape.
+  let shape;
+  assert.doesNotThrow(() => { shape = jsonSchemaToZodShape(schema); });
+  // shape.arr is a ZodType (depth-capped nested array) — just verify it exists.
+  assert.ok(shape.arr, "shape.arr should be a ZodType");
+});
+
+test("F2: enum with non-string entries (e.g. numbers) degrades to z.unknown", () => {
+  const shape = jsonSchemaToZodShape({
+    type: "object",
+    properties: { code: { enum: [1, 2, 3] } },
+    required: ["code"],
+  });
+  // z.unknown() accepts anything
+  assert.equal(shape.code.safeParse(1).success, true);
+  assert.equal(shape.code.safeParse("anything").success, true);
+});
