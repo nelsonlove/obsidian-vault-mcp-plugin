@@ -165,9 +165,56 @@ export function createFsHandler(opts?: FsHandlerOpts): FsHandler {
   let readyPromise: Promise<void> | null = null;
   let watcher: VaultWatcherHandle | null = null;
 
+  // Build the vault index + start the watcher. Idempotent; re-armed by stop().
+  function ready(): Promise<void> {
+    if (readyPromise) return readyPromise;
+
+    readyPromise = (async () => {
+      await buildIndex();
+      const s = indexStatus();
+      console.error(
+        `index: ${s.status} (${s.count} notes)${s.error ? ` — error: ${s.error}` : ""}`,
+      );
+      if (s.status !== "ready") {
+        console.error("watcher: skipped (index not ready)");
+        return;
+      }
+      try {
+        watcher = await startVaultWatcher({ vaultRoot: vaultRoot() });
+      } catch (e) {
+        console.error(
+          `watcher: failed to start — ${e instanceof Error ? e.message : String(e)}`,
+        );
+      }
+    })();
+
+    return readyPromise;
+  }
+
+  async function stop(): Promise<void> {
+    // Re-arm ready() so a later return to FS mode rebuilds the index + restarts
+    // the watcher. The watcher must NOT run during LIVE mode: a live vault
+    // watcher corrupts child_process fd setup under launchd and EBADFs the
+    // bridge spawn (see front.ts wireFailover).
+    readyPromise = null;
+    if (!watcher) return;
+    const w = watcher;
+    watcher = null;
+    try {
+      await w.stop();
+    } catch (e) {
+      console.error(
+        `watcher: stop failed — ${e instanceof Error ? e.message : String(e)}`,
+      );
+    }
+  }
+
   return {
     // ── Per-request handler ─────────────────────────────────────────────────
     async handle(req: express.Request, res: express.Response): Promise<void> {
+      // Lazily build the index on first FS-mode use. In LIVE mode the FS
+      // machinery (and its watcher) never starts, keeping the bridge spawn safe.
+      await ready();
       const server = buildFsServer(opts);
       const transport = new StreamableHTTPServerTransport({
         sessionIdGenerator: undefined,
@@ -186,44 +233,7 @@ export function createFsHandler(opts?: FsHandlerOpts): FsHandler {
       }
     },
 
-    // ── One-time startup ────────────────────────────────────────────────────
-    ready(): Promise<void> {
-      if (readyPromise) return readyPromise;
-
-      readyPromise = (async () => {
-        await buildIndex();
-        const s = indexStatus();
-        console.error(
-          `index: ${s.status} (${s.count} notes)${s.error ? ` — error: ${s.error}` : ""}`,
-        );
-        if (s.status !== "ready") {
-          console.error("watcher: skipped (index not ready)");
-          return;
-        }
-        try {
-          watcher = await startVaultWatcher({ vaultRoot: vaultRoot() });
-        } catch (e) {
-          console.error(
-            `watcher: failed to start — ${e instanceof Error ? e.message : String(e)}`,
-          );
-        }
-      })();
-
-      return readyPromise;
-    },
-
-    // ── Cleanup ─────────────────────────────────────────────────────────────
-    async stop(): Promise<void> {
-      if (!watcher) return;
-      const w = watcher;
-      watcher = null;
-      try {
-        await w.stop();
-      } catch (e) {
-        console.error(
-          `watcher: stop failed — ${e instanceof Error ? e.message : String(e)}`,
-        );
-      }
-    },
+    ready,
+    stop,
   };
 }

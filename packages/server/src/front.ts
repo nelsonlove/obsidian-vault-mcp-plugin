@@ -126,20 +126,27 @@ const LIST_CHANGED = {
 export function wireFailover(deps: {
   presence: { on(ev: "up" | "down", cb: () => void): void };
   live: { teardownAll(): void; notifyAll(msg: object): void };
+  fs: { ready(): Promise<void>; stop(): Promise<void> };
 }): void {
-  const { presence, live } = deps;
+  const { presence, live, fs } = deps;
 
-  // When Obsidian closes: push list_changed to any open SSE channels, then
-  // tear down live sessions (their plugin backend is gone).
+  // When Obsidian closes: push list_changed to any open SSE channels, tear down
+  // live sessions (their plugin backend is gone), and prewarm the FS index so
+  // the first FS-mode request is fast.
   presence.on("down", () => {
     live.notifyAll(LIST_CHANGED);
     live.teardownAll();
+    void fs.ready().catch(() => {});
   });
 
   // When Obsidian comes back: best-effort nudge; new connects resolve to LIVE
-  // via the request-time isLive() check.  Do NOT tear down existing sessions.
+  // via the request-time isLive() check. Do NOT tear down live sessions. STOP
+  // the FS vault watcher — it must not run during LIVE mode, where a live
+  // watcher corrupts child_process fd setup under launchd and EBADFs the bridge
+  // spawn. fs.stop() re-arms ready() so a later FS return rebuilds it.
   presence.on("up", () => {
     live.notifyAll(LIST_CHANGED);
+    void fs.stop().catch(() => {});
   });
 }
 
@@ -235,13 +242,12 @@ if (process.argv[1] && path.resolve(process.argv[1]) === _thisFile) {
   const app = buildFront({ cfg, token: TOKEN, presence, fs: fsHandler, live: liveProxy });
 
   presence.start();
-  wireFailover({ presence, live: liveProxy });
+  wireFailover({ presence, live: liveProxy, fs: fsHandler });
 
-  fsHandler.ready().catch((e: unknown) => {
-    console.error(
-      `[front] fs index error — ${e instanceof Error ? e.message : String(e)}`,
-    );
-  });
+  // NOTE: the FS index/watcher is built lazily (on first FS-mode request, or
+  // prewarmed by wireFailover on presence "down") — NOT at startup. A vault
+  // watcher running during LIVE mode corrupts child_process fd setup under
+  // launchd and EBADFs the bridge spawn, so FS machinery only runs in FS mode.
 
   app.listen(PORT, HOST, () => {
     console.error(

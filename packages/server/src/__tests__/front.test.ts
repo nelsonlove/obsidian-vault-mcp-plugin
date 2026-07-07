@@ -226,11 +226,28 @@ describe("wireFailover", () => {
 
   // ── 5. "down" → notifyAll(LIST_CHANGED) then teardownAll ──────────────────
 
-  test('"down" calls live.notifyAll(LIST_CHANGED) then live.teardownAll()', () => {
+  // FS stub: records whether ready()/stop() were called.
+  function makeFsStub() {
+    const calls: string[] = [];
+    return {
+      calls,
+      ready(): Promise<void> {
+        calls.push("ready");
+        return Promise.resolve();
+      },
+      stop(): Promise<void> {
+        calls.push("stop");
+        return Promise.resolve();
+      },
+    };
+  }
+
+  test('"down" calls live.notifyAll(LIST_CHANGED) then live.teardownAll() and prewarms fs.ready()', () => {
     const presence = makePresenceStub();
     const live = makeLiveStub();
+    const fs = makeFsStub();
 
-    wireFailover({ presence, live });
+    wireFailover({ presence, live, fs });
     presence.fire("down");
 
     assert.deepEqual(
@@ -238,6 +255,8 @@ describe("wireFailover", () => {
       ["notifyAll", "teardownAll"],
       "notifyAll must be called before teardownAll",
     );
+    assert.ok(fs.calls.includes("ready"), '"down" must prewarm fs.ready()');
+    assert.ok(!fs.calls.includes("stop"), '"down" must not stop fs');
     assert.equal(
       (live.lastMsg as { method?: string } | null)?.method,
       "notifications/tools/list_changed",
@@ -247,13 +266,16 @@ describe("wireFailover", () => {
 
   // ── 6. "up" → notifyAll(LIST_CHANGED) only, teardownAll NOT called ────────
 
-  test('"up" calls live.notifyAll(LIST_CHANGED) and does NOT call teardownAll', () => {
+  test('"up" calls live.notifyAll(LIST_CHANGED), stops fs, and does NOT call teardownAll', () => {
     const presence = makePresenceStub();
     const live = makeLiveStub();
+    const fs = makeFsStub();
 
-    wireFailover({ presence, live });
+    wireFailover({ presence, live, fs });
     presence.fire("up");
 
+    assert.ok(fs.calls.includes("stop"), '"up" must stop the FS watcher');
+    assert.ok(!fs.calls.includes("ready"), '"up" must not build fs');
     assert.equal(
       live.calls.filter((c) => c === "notifyAll").length,
       1,
