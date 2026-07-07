@@ -66,6 +66,29 @@ Run **`obsidian_doctor`** (tool) or **`vault-mcp: Show diagnostics`** (command) 
 | Multiple vaults open | The registration must pin `--vault <name>` (Connect does this for the vault you run it from); `obsidian_doctor` reports the bound vault. A registration made before a second vault existed may be generic — re-run Connect, or add `--vault <name>` to the existing `claude mcp` entry. |
 | A plugin-gated tool is missing | Its backing plugin isn't loaded. Enable it; the tool appears on the next session connect. |
 
+## Publishing tools from other plugins
+
+Other Obsidian plugins can publish their own MCP tools through vault-mcp's bridge. Add the SDK:
+
+    npm install github:nelsonlove/vault-mcp-api#v1.0.0
+
+then in your plugin's `onload()`:
+
+    import { publishTools } from "vault-mcp-api";
+    import { z } from "zod";
+
+    this.register(
+      publishTools(this, [{
+        name: "my_tool",                      // published as <your-plugin-id>_my_tool
+        description: "What it does.",
+        inputSchema: { arg: z.string().describe("…") },
+        readOnly: false,                      // omit or false ⇒ blocked in read-only mode
+        handler: async ({ arg }) => ({ result: "plain JSON out" }),
+      }])
+    );
+
+The SDK handles load order (registers now or on the `vault-mcp:ready` event), re-registration when vault-mcp reloads, and cleanup. Tools appear to new Claude Code sessions on their next connect; they are guarded by vault-mcp's read-only mode and path allowlist like built-ins.
+
 ## Repo
 
 `~/repos/obsidian-vault-mcp-plugin`. See `CLAUDE.md` for the locked architecture decisions.
