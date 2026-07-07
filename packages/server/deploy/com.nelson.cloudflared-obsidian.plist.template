@@ -1,0 +1,55 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  LaunchAgent for the Cloudflare Tunnel that fronts the proxy.
+
+  This uses a REMOTELY-MANAGED (token-based) tunnel: the tunnel + its ingress
+  rule live at Cloudflare (created via API/dashboard), and cloudflared runs with
+  only a token — no `cloudflared tunnel login`, no local config.yml, no sudo
+  `service install`. See deploy/REMOTE.md § 3 for the one-time create/route steps.
+
+  The run token goes in ~/.config/vault-mcp-remote/tunnel-token (chmod 600) and
+  is read via TUNNEL_TOKEN_FILE, so it never appears in this plist or in `ps`.
+
+  Install:
+    cp deploy/com.nelson.cloudflared-obsidian.plist.template \
+       ~/Library/LaunchAgents/com.nelson.cloudflared-obsidian.plist
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.nelson.cloudflared-obsidian.plist
+    # verify it registers (~a few seconds):
+    grep -i 'Registered tunnel connection' ~/.local/state/vault-mcp-remote/cloudflared.log
+
+  ⚠️ Little Snitch (or any per-app outbound filter): add a PERMANENT allow rule
+  for /opt/homebrew/bin/cloudflared. Because it runs headless under launchd there
+  is no GUI to approve an alert, so an un-ruled connection is silently dropped and
+  the tunnel never registers (TCP connects, then the TLS/QUIC handshake times out
+  — looks like an MTU/network fault but isn't).
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.nelson.cloudflared-obsidian</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/opt/homebrew/bin/cloudflared</string>
+    <string>--no-autoupdate</string>
+    <string>tunnel</string>
+    <string>run</string>
+  </array>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>TUNNEL_TOKEN_FILE</key>
+    <string>/Users/nelson/.config/vault-mcp-remote/tunnel-token</string>
+  </dict>
+
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+
+  <key>StandardOutPath</key>
+  <string>/Users/nelson/.local/state/vault-mcp-remote/cloudflared.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/nelson/.local/state/vault-mcp-remote/cloudflared.log</string>
+</dict>
+</plist>
