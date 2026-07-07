@@ -96,8 +96,11 @@ export function createPresenceMonitor(opts: {
     // Immediate probe so callers don't wait a full poll interval on startup
     void poll();
 
-    // Interval-based polling — the reliable fallback on all platforms
+    // Interval-based polling — the reliable fallback on all platforms.
+    // unref() so the poll timer never keeps the process (or `node --test`) alive
+    // on its own; the HTTP listener owns process lifetime in production.
     timer = setInterval(() => void poll(), pollMs);
+    timer.unref();
 
     // Best-effort fs.watch to trigger faster detection on .sock create/delete.
     // macOS APFS can throw or miss rename events — the interval is the contract.
