@@ -1,10 +1,6 @@
-import { randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import path from "node:path";
 import express, { type Request, type Response, type NextFunction } from "express";
-import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
-import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
-import type { JSONRPCMessage } from "@modelcontextprotocol/sdk/types.js";
 import {
   loadAuthConfig,
   protectedResourceMetadata,
@@ -13,6 +9,7 @@ import {
   isAllowlistActive,
   isAllowAnyAuthenticated,
 } from "./auth.js";
+import { createLiveProxy } from "./live-proxy.js";
 
 /**
  * obsidian-vault-mcp-server — remote-proxy (plugin-backed remote mode)
@@ -43,6 +40,8 @@ import {
  *       can find the authorization server.
  * At least one method must be configured or the proxy refuses to start (it must
  * never serve a public endpoint unauthenticated).
+ *
+ * Session machinery is delegated to createLiveProxy (live-proxy.ts).
  */
 
 const PORT = Number(process.env.PORT ?? 8787);
@@ -58,15 +57,10 @@ const BRIDGE =
 // avoid tearing down a live-but-idle session mid-conversation. A client whose
 // session was reaped simply re-initializes on the next 404. Tune via env.
 const IDLE_MS = Number(process.env.VAULT_MCP_IDLE_MS ?? 30 * 60 * 1000);
-const REAP_MS = 60 * 1000;
 // Hard cap on concurrent bridge.mjs backends (registered + pending init), so a
 // retry loop or probe flood can't spawn unbounded node processes and starve the
 // interactive Obsidian app the proxy depends on.
 const MAX_SESSIONS = Number(process.env.VAULT_MCP_MAX_SESSIONS ?? 32);
-// Tear down a backend whose initialize never completes within this window
-// (abandoned/malformed initialize would otherwise orphan it — onsessioninitialized
-// never fires, so the reaper, which only walks registered sessions, can't see it).
-const PENDING_INIT_MS = 30 * 1000;
 
 // OAuth resource-server config (provider-agnostic, env-driven; no-op unless
 // AUTH_ENABLED is truthy). Throws on AUTH_ENABLED with missing AUTH_* vars.
@@ -102,93 +96,8 @@ if (authConfig.enabled && !isAllowlistActive() && !isAllowAnyAuthenticated()) {
  */
 const authGate = createAuthGate(authConfig, { token: TOKEN });
 
-/** True if a JSON-RPC body (single or batch) contains an `initialize` request. */
-function isInitialize(body: unknown): boolean {
-  const one = (m: unknown) =>
-    !!m && typeof m === "object" && (m as { method?: string }).method === "initialize";
-  return Array.isArray(body) ? body.some(one) : one(body);
-}
-
-interface Session {
-  http: StreamableHTTPServerTransport;
-  backend: StdioClientTransport;
-  lastSeen: number;
-}
-const sessions = new Map<string, Session>();
-// Counts every live backend, including ones still mid-initialize (not yet in
-// `sessions`), so MAX_SESSIONS bounds the true process count.
-let liveBackends = 0;
-
-/**
- * Create a new session: a fresh HTTP transport wired straight to a freshly
- * spawned `bridge.mjs`. Messages are piped at the transport level in both
- * directions; closing either end tears down the other. A pending-init timer
- * reaps the backend if the client never finishes initializing.
- */
-async function makeSession(): Promise<StreamableHTTPServerTransport> {
-  const backend = new StdioClientTransport({
-    command: process.execPath, // node
-    args: [BRIDGE],
-    stderr: "inherit",
-  });
-  liveBackends++;
-
-  const http = new StreamableHTTPServerTransport({
-    sessionIdGenerator: () => randomUUID(),
-    onsessioninitialized: (sid: string) => {
-      clearTimeout(initTimer);
-      sessions.set(sid, { http, backend, lastSeen: Date.now() });
-      console.error(`[remote-proxy] session ${sid} opened (${liveBackends} live)`);
-    },
-  });
-
-  let torndown = false;
-  const teardown = () => {
-    if (torndown) return;
-    torndown = true;
-    clearTimeout(initTimer);
-    liveBackends--;
-    const sid = http.sessionId;
-    if (sid) sessions.delete(sid);
-    backend.close().catch(() => {});
-    http.close().catch(() => {});
-    console.error(`[remote-proxy] session ${sid ?? "(uninitialized)"} closed (${liveBackends} live)`);
-  };
-
-  // Client → plugin. If the backend is gone, answer the pending request with a
-  // JSON-RPC error instead of silently dropping it (client would otherwise hang).
-  http.onmessage = (msg: JSONRPCMessage) => {
-    backend.send(msg).catch((e) => {
-      console.error("[remote-proxy] backend.send failed", e);
-      const id = (msg as { id?: string | number | null }).id;
-      if (id !== undefined && id !== null) {
-        http
-          .send({ jsonrpc: "2.0", id, error: { code: -32001, message: "backend unavailable" } })
-          .catch(() => {});
-      }
-    });
-  };
-  // Plugin → client.
-  backend.onmessage = (msg: JSONRPCMessage) => {
-    http.send(msg).catch((e) => console.error("[remote-proxy] http.send failed", e));
-  };
-
-  http.onclose = teardown;
-  backend.onclose = teardown;
-  backend.onerror = (e) => console.error("[remote-proxy] backend error", e);
-
-  const initTimer = setTimeout(() => {
-    if (!torndown && !http.sessionId) {
-      console.error("[remote-proxy] initialize did not complete; reaping orphan backend");
-      teardown();
-    }
-  }, PENDING_INIT_MS);
-  initTimer.unref();
-
-  await backend.start();
-  await http.start();
-  return http;
-}
+// Session machinery is entirely inside createLiveProxy.
+const live = createLiveProxy({ bridgePath: BRIDGE, maxSessions: MAX_SESSIONS, idleMs: IDLE_MS });
 
 const app = express();
 
@@ -212,56 +121,9 @@ if (authConfig.enabled) {
   app.get(`${prmPath()}/mcp`, prm);
 }
 
-/** Resolve the HTTP transport for a request, creating a session on initialize. */
-async function route(
-  req: Request,
-): Promise<StreamableHTTPServerTransport | { error: number; message: string }> {
-  const sid = req.header("mcp-session-id");
-  if (sid) {
-    const s = sessions.get(sid);
-    if (!s) return { error: 404, message: "unknown or expired session" };
-    s.lastSeen = Date.now();
-    return s.http;
-  }
-  if (isInitialize(req.body)) {
-    if (liveBackends >= MAX_SESSIONS) {
-      return { error: 503, message: "too many active sessions; try again shortly" };
-    }
-    return makeSession();
-  }
-  return { error: 400, message: "missing Mcp-Session-Id (no active session)" };
-}
-
+// All three MCP methods route through the live-proxy.
 for (const method of ["post", "get", "delete"] as const) {
-  app[method]("/mcp", authGate, parseBody, async (req, res) => {
-    try {
-      const r = await route(req);
-      if ("error" in r) {
-        res.status(r.error).json({
-          jsonrpc: "2.0",
-          error: { code: -32000, message: r.message },
-          id: null,
-        });
-        return;
-      }
-      await r.handleRequest(req, res, req.body);
-    } catch (e) {
-      // The usual cause here is the backend dying (Obsidian closed / vault-mcp
-      // plugin disabled / socket gone), so surface that distinctly from a real
-      // proxy bug rather than an opaque 500.
-      console.error("[remote-proxy] handler error", e);
-      if (!res.headersSent) {
-        res.status(503).json({
-          jsonrpc: "2.0",
-          error: {
-            code: -32603,
-            message: "backend unavailable — is Obsidian running with the vault-mcp plugin?",
-          },
-          id: null,
-        });
-      }
-    }
-  });
+  app[method]("/mcp", authGate, parseBody, (req, res) => live.handle(req, res));
 }
 
 // Turn body-parser failures (notably oversized payloads) into JSON-RPC errors
@@ -276,18 +138,6 @@ app.use((err: unknown, _req: Request, res: Response, next: NextFunction) => {
     id: null,
   });
 });
-
-// Reap idle sessions so orphaned bridge.mjs backends don't accumulate.
-const reaper = setInterval(() => {
-  const now = Date.now();
-  for (const [sid, s] of sessions) {
-    if (now - s.lastSeen > IDLE_MS) {
-      console.error(`[remote-proxy] reaping idle session ${sid}`);
-      s.http.close().catch(() => {}); // triggers teardown → backend.close()
-    }
-  }
-}, Math.min(REAP_MS, IDLE_MS));
-reaper.unref();
 
 app.listen(PORT, HOST, () => {
   console.error(`[remote-proxy] listening on http://${HOST}:${PORT}/mcp → ${BRIDGE}`);
