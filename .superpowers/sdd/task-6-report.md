@@ -77,3 +77,44 @@ Added exports: `registerFsTools`, `RegisterFsToolsOpts`, `IndexStatusSnapshot`.
 tools/list count: **17** ✓  
 Names (sorted): obsidian_append_note, obsidian_delete_note, obsidian_find_by_tag, obsidian_force_reindex, obsidian_get_backlinks, obsidian_get_outlinks, obsidian_list_folders, obsidian_list_notes, obsidian_manage_frontmatter, obsidian_move_note, obsidian_patch_note, obsidian_read_note, obsidian_read_notes, obsidian_resolve, obsidian_search_by_frontmatter, obsidian_search_notes, obsidian_write_note — all match FS_TOOLS exactly.  
 Input schemas confirmed: `obsidian_resolve` has `refs` array (not `ref`), `obsidian_move_note` has `update_backlinks`.
+
+## Reconciliation
+
+**Commit:** `26c82a9` — `refactor(core): reconcile FS_TOOLS registry to best-of-both (resolve refs+from, accurate annotations, backend-neutral descriptions)`
+
+**Build + test:** `npm run build` clean for both `packages/core` and `packages/server`; `npm test --workspaces --if-present` — **132/132 pass** (59 core, 64 plugin, 9 server).
+
+### Changes applied per spec
+
+**`packages/core/src/tool-registry.ts`**
+
+- `obsidian_resolve`: added `from: z.string().optional()` to `inputSchema`, with `.describe()` noting it is best-effort context for relative-link disambiguation — honored by the live Obsidian backend, ignored by the filesystem backend. Updated tool description to mention `from` is backend-dependent.
+- `obsidian_get_backlinks`: removed FS-specific "computed from the in-memory index, which auto-refreshes on disk changes within ~300ms" phrasing; now reads "resolved from the vault index; call `obsidian_force_reindex` if you need a synchronous index refresh before querying."
+- `obsidian_search_by_frontmatter`: removed "Backed by the in-memory index, which auto-refreshes on disk changes within ~300ms" — replaced with "Backed by the vault index."
+- `obsidian_move_note`: removed "in-memory index built at startup" → "vault index"; removed watcher/~300ms language; replaced with neutral "Call `obsidian_force_reindex` after the move if downstream queries need a synchronous index refresh."
+- `obsidian_manage_frontmatter`: removed "the watcher auto-refreshes the in-memory index within ~300ms" — replaced with "changes are applied live. Call `obsidian_force_reindex` before follow-up index queries if you need a synchronous refresh."
+- `obsidian_force_reindex`: complete description rewrite to backend-neutral: "Rebuilds the vault index on backends that maintain one; a no-op on backends whose cache is always live." Removed all FS-specific timing/watcher details. Title updated from "Force-rebuild the in-memory vault index" → "Force-rebuild the vault index". Comment updated from "mutates in-memory index" → "mutates the index".
+- `obsidian_delete_note`: dropped specific incident date "2026-06-04"; retained the safety rationale.
+- Annotations (`patch_note`/`write_note`/`move_note` = `DESTRUCTIVE`; `force_reindex` = `{readOnlyHint:false, destructiveHint:false, idempotentHint:true, openWorldHint:false}`) — verified already correct at HEAD; no changes needed.
+
+**`packages/core/src/register-fs-tools.ts`**
+
+- `obsidian_resolve` handler: updated destructured type to `{ refs: string[]; from?: string }`, ignoring `_from` with a comment explaining graceful degradation (FS backend has no `from` parameter; folder-relative resolution is a documented follow-up).
+
+**`packages/core/tests/tool-registry.test.mjs`**
+
+Added three new assertions:
+- `obsidian_resolve` has both `refs` and optional `from` in `inputSchema`
+- `obsidian_patch_note`, `obsidian_write_note`, `obsidian_move_note` carry `DESTRUCTIVE` annotations
+- `obsidian_force_reindex` has `readOnlyHint=false`, `destructiveHint=false`, `idempotentHint=true`
+
+**`packages/server/src/__tests__/register-fs-tools.test.ts`**
+
+Updated the `obsidian_resolve` spot-check to also assert `schema.properties.from` exists and is NOT in the `required` array (confirming it is optional in the JSON Schema output).
+
+### tools/list spot-check
+
+- `obsidian_resolve`: `properties.refs` (type: array) ✓, `properties.from` present ✓, `from` not in `required` ✓, no legacy `ref` field ✓
+- `obsidian_move_note`: `properties.update_backlinks` ✓, `properties.overwrite` ✓
+- `obsidian_patch_note`/`obsidian_write_note`/`obsidian_move_note` annotations: `destructiveHint: true` ✓
+- `obsidian_force_reindex` annotations: `readOnlyHint: false`, `destructiveHint: false`, `idempotentHint: true` ✓
