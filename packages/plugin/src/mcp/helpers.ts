@@ -1,4 +1,5 @@
 import { posix } from "node:path";
+// import ok separately (okError uses it in its body); re-export exposes ok/fail as this module's public API
 import { ok } from "@vault-mcp/core";
 export { ok, fail } from "@vault-mcp/core";
 
