@@ -501,3 +501,31 @@ test("applyAddOrChange: duplicate jd-id is accepted; second-wins like full rebui
   // case (here it's the incremental insertion order).
   assert.equal(indexStore.resolveRefs(["77.07"])[0].path, "second.md");
 });
+
+// =============================================================================
+// Issue #27 — unquoted numeric jd-ids with leading zeros (#27)
+// =============================================================================
+
+test("#27 parseAllFrontmatter: unquoted jd-id with leading zero stays a string", () => {
+  // coerceScalar must not parse "03.05" as the float 3.05.
+  const text = `---\njd-id: 03.05\n---\nBody.`;
+  const fm = indexStore.parseAllFrontmatter(text);
+  assert.equal(fm["jd-id"], "03.05", 'jd-id should remain "03.05", not become 3.05');
+});
+
+test("#27 resolveRefs: unquoted jd-id 03.05 is resolvable by the string '03.05'", async () => {
+  await writeNote("slot.md", "---\njd-id: 03.05\n---\nBody.");
+  await indexStore.buildIndex();
+  const r = indexStore.resolveRefs(["03.05"])[0];
+  assert.equal(r.path, "slot.md");
+  assert.equal(r.matched_by, "jd-id");
+});
+
+test("#27 searchByFrontmatter: unquoted jd-id 03.05 findable by string value '03.05'", async () => {
+  await writeNote("slot.md", "---\njd-id: 03.05\n---\nBody.");
+  await indexStore.buildIndex();
+  const matches = indexStore.searchByFrontmatter("jd-id", "03.05");
+  assert.equal(matches.length, 1);
+  assert.equal(matches[0].path, "slot.md");
+});
+
