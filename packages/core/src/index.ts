@@ -6,6 +6,8 @@ export {
   FmValue,
 } from "./tool-registry.js";
 export type { Capability, ToolDef, ToolAnnotations } from "./tool-registry.js";
+export { registerFsTools } from "./register-fs-tools.js";
+export type { RegisterFsToolsOpts, IndexStatusSnapshot } from "./register-fs-tools.js";
 export type {
   VaultBackend,
   FrontmatterScalar,

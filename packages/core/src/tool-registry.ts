@@ -67,6 +67,9 @@ export const FmValue = z.union([
 ]);
 
 // ── The 17 filesystem-expressible tools ──────────────────────────────────────
+//
+// Schemas here are authoritative — they define what the MCP server advertises
+// in tools/list. Keep them byte-identical to the server's previous inline defs.
 
 const { RO, RW, DESTRUCTIVE } = SHARED_ANNOTATIONS;
 
@@ -75,16 +78,16 @@ export const FS_TOOLS: ToolDef[] = [
 
   {
     name: "obsidian_list_notes",
-    title: "List notes",
+    title: "List vault notes",
     description:
-      "List markdown notes, optionally under a subfolder, with pagination. Read-only.",
+      "List markdown notes in the vault as vault-relative paths. Optionally scope to a subfolder. Paginated. Read-only.",
     inputSchema: {
       subdir: z
         .string()
         .optional()
-        .describe("Vault-relative subfolder, e.g. 'Daily'. Omit for the whole vault."),
-      limit: z.number().int().min(1).max(500).default(100),
-      offset: z.number().int().min(0).default(0),
+        .describe("Optional vault-relative subfolder to scope the listing, e.g. 'Daily'."),
+      limit: z.number().int().min(1).max(500).default(100).describe("Max notes to return."),
+      offset: z.number().int().min(0).default(0).describe("Notes to skip (pagination)."),
     },
     annotations: RO,
     capability: "fs-expressible",
@@ -92,14 +95,14 @@ export const FS_TOOLS: ToolDef[] = [
 
   {
     name: "obsidian_list_folders",
-    title: "List folders",
+    title: "List immediate child folders",
     description:
-      "List immediate subfolders of a folder (or the vault root), each with a recursive markdown-note count. Read-only.",
+      "Return the immediate child folders of `subdir` (or the vault root) with a recursive markdown-note count for each. Useful for discovering vault structure before narrowing scope with `obsidian_list_notes`. Hidden directories (`.obsidian/`, `.trash/`, etc.) are excluded. Read-only.",
     inputSchema: {
       subdir: z
         .string()
         .optional()
-        .describe("Vault-relative subfolder. Omit for the vault root."),
+        .describe("Optional vault-relative subfolder. Defaults to vault root."),
     },
     annotations: RO,
     capability: "fs-expressible",
@@ -126,15 +129,13 @@ export const FS_TOOLS: ToolDef[] = [
     name: "obsidian_read_notes",
     title: "Read multiple notes",
     description:
-      "Read several notes at once. One missing/unreadable path is reported in `errors` and does not fail the call. Read-only.",
+      "Read several notes in one call. Returns `notes` for successful reads and `errors` for paths that failed (missing, ignored folders, etc.) — one bad path doesn't fail the whole call. Each note is truncated independently at the per-note character limit. Read-only.",
     inputSchema: {
       paths: z
         .array(z.string().min(1))
         .min(1)
         .max(50)
-        .describe(
-          "Vault-relative paths, e.g. ['Projects/A.md','Daily/2026-06-05.md']."
-        ),
+        .describe("Vault-relative paths, e.g. ['Projects/A.md', 'Daily/2026-06-05.md']. Max 50 per call."),
     },
     annotations: RO,
     capability: "fs-expressible",
@@ -146,11 +147,16 @@ export const FS_TOOLS: ToolDef[] = [
     name: "obsidian_search_notes",
     title: "Search notes",
     description:
-      "Case-insensitive substring search across note contents, line by line. Read-only.",
+      "Case-insensitive full-text search across all notes. Returns matching lines (path, line number, snippet). By default returns one match per note for broad coverage; pass `mode: \"all\"` to get every matching line up to `limit`. Read-only.",
     inputSchema: {
       query: z.string().min(1).describe("Text to search for."),
-      limit: z.number().int().min(1).max(500).default(25),
-      mode: z.enum(["one_per_note", "all"]).default("one_per_note"),
+      limit: z.number().int().min(1).max(500).default(25).describe("Max hits to return."),
+      mode: z
+        .enum(["one_per_note", "all"])
+        .default("one_per_note")
+        .describe(
+          "`one_per_note` (default) returns the first match per file; `all` returns every matching line until `limit`. Use `all` when you need multiple hits inside the same note."
+        ),
     },
     annotations: RO,
     capability: "fs-expressible",
@@ -160,15 +166,10 @@ export const FS_TOOLS: ToolDef[] = [
     name: "obsidian_find_by_tag",
     title: "Find notes by tag",
     description:
-      "List notes carrying a tag (inline or in frontmatter), matched from the live metadata cache. Read-only.",
+      "Find notes carrying a given tag, from YAML frontmatter `tags:` or inline `#tag`. Pass the tag with or without '#'. Read-only.",
     inputSchema: {
-      tag: z
-        .string()
-        .min(1)
-        .describe(
-          "Tag to match, e.g. 'project' or '#project' (with or without #)."
-        ),
-      limit: z.number().int().min(1).max(200).default(50),
+      tag: z.string().min(1).describe("Tag to match, e.g. 'project' or '#project'."),
+      limit: z.number().int().min(1).max(200).default(50).describe("Max notes to return."),
     },
     annotations: RO,
     capability: "fs-expressible",
@@ -176,18 +177,23 @@ export const FS_TOOLS: ToolDef[] = [
 
   {
     name: "obsidian_search_by_frontmatter",
-    title: "Search by frontmatter",
+    title: "Search notes by a frontmatter field/value",
     description:
-      "Find notes whose frontmatter property equals a value (array properties match any element). Read-only.",
+      "Find notes whose frontmatter has `property == value`. Property match is case-insensitive (Obsidian convention); value match is case-sensitive (exact). " +
+      "For array-typed fields (`tags`, `aliases`, etc.) the note matches if any array element equals the value. " +
+      "Backed by the in-memory index, which auto-refreshes on disk changes within ~300ms; call `obsidian_force_reindex` if you need to wait synchronously before querying. Read-only.",
     inputSchema: {
       property: z
         .string()
         .min(1)
         .max(64)
-        .regex(PROP_RE)
-        .describe("Frontmatter field name."),
-      value: z.string().min(1).describe("Exact value to match."),
-      limit: z.number().int().min(1).max(500).default(100),
+        .regex(PROP_RE, "Property must be a YAML identifier (letters/digits/underscore/hyphen, starting with letter or underscore)")
+        .describe("Frontmatter field name, e.g. 'status', 'tags', 'jd-id'."),
+      value: z
+        .string()
+        .min(1)
+        .describe("Exact value to match. For array fields, matches if any element equals this."),
+      limit: z.number().int().min(1).max(500).default(100).describe("Max notes to return."),
     },
     annotations: RO,
     capability: "fs-expressible",
@@ -197,20 +203,20 @@ export const FS_TOOLS: ToolDef[] = [
 
   {
     name: "obsidian_resolve",
-    title: "Resolve link reference",
+    title: "Resolve references to vault paths",
     description:
-      "Resolve a wikilink/path/basename to a canonical vault path using Obsidian's own resolver. Read-only.",
+      "Resolve one or more references (wikilinks, basenames, aliases, JD-IDs, or vault-relative paths) to canonical vault paths. " +
+      "Algorithm matches Obsidian's: exact path → JD-ID → basename → frontmatter alias. " +
+      "Accepts `[[...]]` wrapping, `|alias` display text, and `#heading` / `#^block` fragments — those are stripped for matching and preserved in the response. " +
+      "Multiple basename or alias matches return as `ambiguous` with all candidates so the caller can disambiguate. Read-only.",
     inputSchema: {
-      ref: z
-        .string()
+      refs: z
+        .array(z.string().min(1))
         .min(1)
+        .max(100)
         .describe(
-          "Link text, basename, or path, e.g. '[[Roadmap]]' or 'Roadmap'."
+          "References to resolve, e.g. ['Daily Standup', '[[92.05]]', 'Projects/A.md#Goals']."
         ),
-      from: z
-        .string()
-        .optional()
-        .describe("Source note path for context-sensitive resolution."),
     },
     annotations: RO,
     capability: "fs-expressible",
@@ -218,14 +224,14 @@ export const FS_TOOLS: ToolDef[] = [
 
   {
     name: "obsidian_get_backlinks",
-    title: "Get backlinks",
+    title: "Get backlinks to a note",
     description:
-      "List notes that link TO the given note, from Obsidian's live metadata cache (canonical — resolves aliases, embeds, block refs). Read-only.",
+      "List notes that contain a `[[wikilink]]` pointing at the given note. Backlinks are computed from the in-memory index, which auto-refreshes on disk changes within ~300ms; call `obsidian_force_reindex` if you need to wait synchronously before querying. Read-only.",
     inputSchema: {
       path: z
         .string()
         .min(1)
-        .describe("Vault-relative path of the target note."),
+        .describe("Vault-relative path of the target note, e.g. 'Projects/Plan.md'."),
     },
     annotations: RO,
     capability: "fs-expressible",
@@ -233,28 +239,32 @@ export const FS_TOOLS: ToolDef[] = [
 
   {
     name: "obsidian_get_outlinks",
-    title: "Get outlinks",
+    title: "Get outbound links from a note",
     description:
-      "List links and embeds OUT of a note, each resolved to a canonical vault path via the live cache. Read-only.",
+      "List `[[wikilinks]]` in the body of a note, with each ref's resolved path when resolution is unambiguous. Useful for traversal without re-reading the note. Read-only.",
     inputSchema: {
       path: z
         .string()
         .min(1)
-        .describe("Vault-relative path of the source note."),
+        .describe("Vault-relative path of the source note, e.g. 'Projects/Plan.md'."),
     },
     annotations: RO,
     capability: "fs-expressible",
   },
 
-  // ── vault-read: utility ───────────────────────────────────────────────────
+  // ── vault-read: index utility ─────────────────────────────────────────────
 
   {
     name: "obsidian_force_reindex",
-    title: "Force reindex (no-op)",
+    title: "Force-rebuild the in-memory vault index",
     description:
-      "No-op: Obsidian's metadata cache is always live, so there is nothing to rebuild. Returns immediately. Read-only.",
+      "Re-walk the vault from disk and rebuild the in-memory index (basename / alias / JD-ID / frontmatter / backlinks). " +
+      "Normally unnecessary — the watcher refreshes the index within ~300ms of any disk change. Call this when you need to wait synchronously before a follow-up query (tight read-after-write loop), or when you suspect the watcher missed an event. " +
+      "Bounded by the disk walk: ~5–10s cold on spinning disk, sub-second with a warm pagecache. Concurrent callers share a single in-flight rebuild. " +
+      "Reads served during the rebuild see the previous ready index — there's no zero-count window. Idempotent.",
     inputSchema: {},
-    annotations: RO,
+    // Not read-only (mutates in-memory index), but idempotent.
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     capability: "fs-expressible",
   },
 
@@ -262,22 +272,22 @@ export const FS_TOOLS: ToolDef[] = [
 
   {
     name: "obsidian_manage_frontmatter",
-    title: "Manage frontmatter",
+    title: "Get / set / delete a single frontmatter field",
     description:
-      "Get, set, or delete a single frontmatter key. Set/delete use Obsidian's atomic processFrontMatter, preserving other keys' formatting.",
+      "Read or modify one top-level frontmatter field of a note. Supports inline-scalar (`key: value`), inline-array (`key: [a, b]`), and block-array (`key:\\n  - a`) shapes. " +
+      "Refuses to edit fields using block-scalar (|/>) or inline-object shapes to avoid silent corruption. " +
+      "`set` creates the frontmatter block if absent. Other keys' formatting (indentation, quoting) is preserved — only the target key's lines get rewritten. " +
+      "Note: changes are written to disk live, and the watcher auto-refreshes the in-memory index within ~300ms. Tight read-after-write loops should call obsidian_force_reindex first to wait synchronously.",
     inputSchema: {
-      path: z
-        .string()
-        .min(1)
-        .describe("Vault-relative path ending in .md."),
+      path: z.string().min(1).describe("Vault-relative path of the note, ending in .md."),
       key: z
         .string()
         .min(1)
         .max(64)
-        .regex(PROP_RE)
+        .regex(PROP_RE, "Key must be a YAML identifier (letters/digits/underscore/hyphen, starting with letter or underscore)")
         .describe("Frontmatter field name."),
-      op: z.enum(["get", "set", "delete"]),
-      value: FmValue.optional().describe("Required for op='set'."),
+      op: z.enum(["get", "set", "delete"]).describe("Operation."),
+      value: FmValue.optional().describe("Required for `set`. Ignored otherwise. Arrays serialize as block lists."),
     },
     annotations: RW,
     capability: "fs-expressible",
@@ -287,24 +297,29 @@ export const FS_TOOLS: ToolDef[] = [
 
   {
     name: "obsidian_patch_note",
-    title: "Patch a note section",
+    title: "Patch a note relative to a heading or block anchor",
     description:
-      "Append/prepend/replace content at a heading or block-id anchor. Returns found=false (no write) if the anchor is not present.",
+      "Insert / replace content at a named anchor inside a note. Three operations × two anchor types:\n" +
+      "  - `heading` anchor: matches the first `## My Heading` line whose text exactly equals the anchor value (case-sensitive). " +
+      "If multiple headings have the same text, only the first is patched. The anchor's 'content' is the section body — lines from after the heading up to the next heading of equal or higher level, or EOF. The heading line itself is preserved across all three ops.\n" +
+      "  - `block` anchor: matches the first paragraph whose final token is `^<value>` (whitespace-bounded). The anchor's 'content' is the entire paragraph (lines from prior blank line up to next blank line). `prepend`/`append` operate on the WHOLE paragraph, not just the line containing `^<value>`. `replace` swaps the entire paragraph (and the `^<value>` token with it — include it in `content` if you want the block ref preserved).\n" +
+      "`content` is inserted verbatim into the line stream — newlines preserved. Callers wanting paragraph-level separation (a blank line between the inserted content and the anchor's content) should include the blank line(s) in `content` themselves. " +
+      "Returns `found: false` if the anchor doesn't match; no write happens. Returns the prior content as `previous` so the caller can undo or audit. " +
+      "For frontmatter-field edits use `obsidian_manage_frontmatter` instead — patch_note doesn't shadow it.",
     inputSchema: {
-      path: z
-        .string()
-        .min(1)
-        .describe("Vault-relative path ending in .md."),
-      anchor_type: z.enum(["heading", "block"]),
+      path: z.string().min(1).describe("Vault-relative path of the note, ending in .md."),
+      anchor_type: z.enum(["heading", "block"]).describe("Anchor matcher: 'heading' or 'block'."),
       anchor: z
         .string()
         .min(1)
         .max(500)
-        .describe("Heading text (no #) or block id (no ^)."),
-      op: z.enum(["append", "prepend", "replace"]),
-      content: z.string().describe("Markdown to insert; newlines preserved."),
+        .describe(
+          "Anchor value: the exact heading text (without leading `#`s and whitespace) OR the block ID (without leading `^`)."
+        ),
+      op: z.enum(["append", "prepend", "replace"]).describe("Where to put the content relative to the anchor."),
+      content: z.string().describe("Markdown to insert or use as replacement. Newlines preserved."),
     },
-    annotations: RW,
+    annotations: DESTRUCTIVE,
     capability: "fs-expressible",
   },
 
@@ -314,16 +329,13 @@ export const FS_TOOLS: ToolDef[] = [
     name: "obsidian_write_note",
     title: "Write a note",
     description:
-      "Create a note, or overwrite an existing one when `overwrite` is true. Parent folders are created as needed.",
+      "Create a note, or overwrite an existing one when overwrite=true. Path must end in .md. Parent folders are created as needed. Writes propagate to your other devices via Obsidian Sync.",
     inputSchema: {
-      path: z
-        .string()
-        .min(1)
-        .describe("Vault-relative path ending in .md."),
-      content: z.string(),
-      overwrite: z.boolean().default(false),
+      path: z.string().min(1).describe("Vault-relative path ending in .md."),
+      content: z.string().describe("Full markdown content to write."),
+      overwrite: z.boolean().default(false).describe("Replace an existing note. Default false (refuses if it exists)."),
     },
-    annotations: RW,
+    annotations: DESTRUCTIVE,
     capability: "fs-expressible",
   },
 
@@ -331,13 +343,10 @@ export const FS_TOOLS: ToolDef[] = [
     name: "obsidian_append_note",
     title: "Append to a note",
     description:
-      "Append content to a note, creating it (and parent folders) if absent.",
+      "Append markdown to a note (creating it if absent). A newline is inserted before appended content for existing notes. Good for daily logs and running lists.",
     inputSchema: {
-      path: z
-        .string()
-        .min(1)
-        .describe("Vault-relative path ending in .md."),
-      content: z.string().min(1),
+      path: z.string().min(1).describe("Vault-relative path ending in .md."),
+      content: z.string().min(1).describe("Markdown to append."),
     },
     annotations: RW,
     capability: "fs-expressible",
@@ -345,34 +354,41 @@ export const FS_TOOLS: ToolDef[] = [
 
   {
     name: "obsidian_move_note",
-    title: "Move/rename a note",
+    title: "Rename / move a note and rewrite backlinks",
     description:
-      "Move or rename a note. Backlinks are rewritten canonically by Obsidian's fileManager.renameFile.",
+      "Move (or rename) a note from one vault path to another. With `update_backlinks: true` (default), every note that wikilinks to `from` is rewritten to point at `to`. " +
+      "Resolution uses the in-memory index built at startup: only refs that currently resolve to `from` are touched; ambiguous basename matches are left alone (the index can't tell which note the author meant). " +
+      "Ref *shape* is preserved across the rewrite — bare basename refs (`[[from-basename]]`) get the new basename, full-path refs get the new full path. `|alias` and `#fragment` suffixes are kept verbatim. " +
+      "Refuses if `to` already exists unless `overwrite: true`. Parent folders of `to` are created as needed. " +
+      "The watcher refreshes the in-memory index within ~300ms after the move; tight read-after-write loops should call `obsidian_force_reindex` first to wait synchronously.",
     inputSchema: {
-      from: z
-        .string()
-        .min(1)
-        .describe("Existing vault-relative path ending in .md."),
-      to: z
-        .string()
-        .min(1)
-        .describe("New vault-relative path ending in .md."),
-      overwrite: z.boolean().default(false),
+      from: z.string().min(1).describe("Existing vault-relative path of the note, ending in .md."),
+      to: z.string().min(1).describe("New vault-relative path, ending in .md."),
+      update_backlinks: z
+        .boolean()
+        .default(true)
+        .describe("Rewrite [[wikilinks]] in other notes that currently resolve to `from`."),
+      overwrite: z
+        .boolean()
+        .default(false)
+        .describe("Replace `to` if it already exists. Default false (refuses)."),
     },
-    annotations: RW,
+    annotations: DESTRUCTIVE,
     capability: "fs-expressible",
   },
 
   {
     name: "obsidian_delete_note",
-    title: "Delete a note",
-    description: "Permanently delete a note. Requires confirm=true.",
+    title: "Delete a note from the vault",
+    description:
+      "Permanently delete a note from disk. The change propagates to your other devices via Obsidian Sync — the same one-way deletion that caused a near-data-loss incident on 2026-06-04 if used wrong. " +
+      "To make accidents harder: `confirm: true` is required at the schema layer. Calls without it are rejected before reaching the filesystem. " +
+      "Backlinks to the deleted note are NOT updated — those refs become 'broken' and can be detected with the existing tooling. Use `obsidian_move_note` if you want to relocate while preserving wikilinks.",
     inputSchema: {
-      path: z
-        .string()
-        .min(1)
-        .describe("Vault-relative path of the note."),
-      confirm: z.literal(true).describe("Must be true to proceed."),
+      path: z.string().min(1).describe("Vault-relative path of the note to delete."),
+      confirm: z
+        .literal(true)
+        .describe("Must be literally `true`. Required guard against accidental deletes."),
     },
     annotations: DESTRUCTIVE,
     capability: "fs-expressible",
