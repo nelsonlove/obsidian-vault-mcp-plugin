@@ -6,10 +6,14 @@
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "exports": {
-    ".": "./dist/index.js"
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
   },
   "scripts": {
-    "build": "tsc"
+    "build": "tsc",
+    "test": "tsc && node --import tsx --test 'tests/*.test.mjs'"
   },
   "dependencies": {
     "zod": "^3.23.8"

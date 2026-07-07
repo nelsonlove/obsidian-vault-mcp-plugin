@@ -35,6 +35,7 @@ import {
   searchByFrontmatter,
 } from "./index-store.js";
 import { startVaultWatcher } from "./vault-watcher.js";
+import { ok, fail } from "@vault-mcp/core";
 
 /**
  * obsidian-vault-mcp-server
@@ -47,21 +48,6 @@ import { startVaultWatcher } from "./vault-watcher.js";
  * egress range and serve over TLS via your reverse proxy. Add real OAuth
  * (Phase 2) in front of, or inside, this process later.
  */
-
-function ok(data: unknown) {
-  return {
-    content: [{ type: "text" as const, text: JSON.stringify(data, null, 2) }],
-    structuredContent: data as Record<string, unknown>,
-  };
-}
-
-function fail(err: unknown) {
-  const message = err instanceof Error ? err.message : String(err);
-  return {
-    content: [{ type: "text" as const, text: `Error: ${message}` }],
-    isError: true,
-  };
-}
 
 function buildServer(): McpServer {
   const server = new McpServer({
