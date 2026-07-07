@@ -334,8 +334,15 @@ function _addToForwardMaps(s: IndexState, note: IndexedNote): void {
         `[index] duplicate jd-id '${note.jdId}' — '${existing.path}' vs '${note.path}'. ` +
           `Second occurrence wins; JD invariant violation worth investigating.`
       );
+      // Use the same tiebreak as buildIndex: notes are processed in lexical
+      // path order, so the lexically-later path is the winner. Only overwrite
+      // when the new note's path sorts after the existing winner's path.
+      if (note.path > existing.path) {
+        s.byJdId.set(note.jdId, note);
+      }
+    } else {
+      s.byJdId.set(note.jdId, note);
     }
-    s.byJdId.set(note.jdId, note);
   }
 
   for (const [rawProp, value] of Object.entries(note.frontmatter)) {

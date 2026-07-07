@@ -529,3 +529,26 @@ test("#27 searchByFrontmatter: unquoted jd-id 03.05 findable by string value '03
   assert.equal(matches[0].path, "slot.md");
 });
 
+// =============================================================================
+// Issue #28 — deterministic duplicate-jd-id winner across incremental + rebuild
+// =============================================================================
+
+test("#28 duplicate jd-id: incremental re-add of loser doesn't override winner", async () => {
+  // A.md < B.md lexically → buildIndex processes A first, B last → B wins.
+  await writeNote("A.md", "---\njd-id: 55.01\n---\nA");
+  await writeNote("B.md", "---\njd-id: 55.01\n---\nB");
+  await indexStore.buildIndex();
+  assert.equal(
+    indexStore.resolveRefs(["55.01"])[0].path,
+    "B.md",
+    "full rebuild: B.md (sorted-last) should win",
+  );
+
+  // Incrementally re-apply the loser (A.md). The winner (B.md) must not change.
+  await indexStore.applyAddOrChange(abs("A.md"));
+  assert.equal(
+    indexStore.resolveRefs(["55.01"])[0].path,
+    "B.md",
+    "after incremental re-add of loser, B.md must still win",
+  );
+});
