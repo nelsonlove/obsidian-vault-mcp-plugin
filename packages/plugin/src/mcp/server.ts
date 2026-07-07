@@ -42,6 +42,6 @@ export function buildMcpServer(app: App, ctx: ServerCtx): McpServer {
   registerNavTools(server, app);
   registerIntegrationTools(server, app, ctx);
   // ── externally-published tools (other Obsidian plugins via plugin.api) ─────
-  registerExternalTools(server, app, ctx.getExternalTools?.() ?? []);
+  registerExternalTools(server, app, ctx);
   return server;
 }
