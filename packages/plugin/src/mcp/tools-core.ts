@@ -7,6 +7,7 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { App, TFile } from "obsidian";
 import { ok, fail } from "./helpers.js";
 import type { GuardSettings } from "../guard.js";
+import type { ExternalToolEntry } from "./external-tools.js";
 
 export interface ServerCtx {
   pluginVersion: string;
@@ -14,6 +15,8 @@ export interface ServerCtx {
   vaultName: string;
   enabledPlugins: () => string[];
   getSettings: () => GuardSettings;
+  /** Externally-published tools (other Obsidian plugins via plugin.api). Optional: absent in tests that don't exercise it. */
+  getExternalTools?: () => ExternalToolEntry[];
 }
 
 const RO = { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false };

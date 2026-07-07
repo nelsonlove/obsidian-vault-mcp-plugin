@@ -1,4 +1,7 @@
-import type { JsonSchemaObject } from "./json-schema-to-zod.js";
+import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import type { App } from "obsidian";
+import { ok, fail } from "./helpers.js";
+import { jsonSchemaToZodShape, type JsonSchemaObject } from "./json-schema-to-zod.js";
 
 // ── Public boundary types (mirrored in the vault-mcp-api SDK — keep in sync) ──
 
@@ -64,5 +67,35 @@ export class ExternalToolRegistry {
 
   entries(): ExternalToolEntry[] {
     return Array.from(this.byName.values());
+  }
+}
+
+const RO = { readOnlyHint: true,  destructiveHint: false, idempotentHint: true,  openWorldHint: false };
+const RW = { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false };
+
+// Called from buildMcpServer AFTER the guard monkeypatch, so external tools are
+// guarded like built-ins. Restrictive default: external tools are mutating
+// unless they explicitly declare readOnlyHint: true (built-ins use the inverse
+// convention — mutating iff readOnlyHint === false — which the guard keys on).
+export function registerExternalTools(server: McpServer, app: App, entries: ExternalToolEntry[]): void {
+  for (const { ownerId, toolName, spec } of entries) {
+    const annotations = spec.annotations?.readOnlyHint === true ? RO : RW;
+    server.registerTool(
+      toolName,
+      {
+        title: toolName,
+        description: spec.description,
+        inputSchema: jsonSchemaToZodShape(spec.inputSchema),
+        annotations,
+      },
+      async (args: Record<string, unknown>) => {
+        // Gate on the LOADED instance (same rule as plugin-gated integrations):
+        // the publisher may have been disabled since this connection was built.
+        if (!(app as any).plugins?.plugins?.[ownerId])
+          return fail(new Error(`publisher plugin '${ownerId}' is no longer loaded`));
+        try { return ok(await spec.handler(args ?? {})); }
+        catch (e) { return fail(e); }
+      }
+    );
   }
 }

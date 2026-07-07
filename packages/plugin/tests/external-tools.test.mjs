@@ -63,3 +63,52 @@ test("registration is atomic: a mid-array validation failure registers nothing",
   assert.throws(() => reg.registerTools("p", [spec("valid_tool"), spec("Bad-Name")]), TypeError);
   assert.equal(reg.entries().length, 0);
 });
+
+// ── registerExternalTools integration tests ────────────────────────────────
+
+import { registerExternalTools } from "../src/mcp/external-tools.ts";
+
+// Minimal stubs: a fake McpServer capturing registerTool calls, a fake App
+// whose plugins map controls the stale-owner check.
+function fakeServer() {
+  const calls = [];
+  return { calls, registerTool: (name, def, handler) => calls.push({ name, def, handler }) };
+}
+const fakeApp = (loadedIds) => ({ plugins: { plugins: Object.fromEntries(loadedIds.map((i) => [i, {}])) } });
+
+test("external tools register namespaced with restrictive-default annotations", () => {
+  const server = fakeServer();
+  registerExternalTools(server, fakeApp(["jd-survey"]), [
+    { ownerId: "jd-survey", toolName: "jd_survey_x", spec: spec("x") },
+    { ownerId: "jd-survey", toolName: "jd_survey_ro", spec: spec("ro", { annotations: { readOnlyHint: true } }) },
+  ]);
+  assert.equal(server.calls[0].name, "jd_survey_x");
+  assert.equal(server.calls[0].def.annotations.readOnlyHint, false); // mutating by default
+  assert.equal(server.calls[1].def.annotations.readOnlyHint, true);
+});
+
+test("handler result is wrapped in ok(); throw becomes fail()", async () => {
+  const server = fakeServer();
+  registerExternalTools(server, fakeApp(["p"]), [
+    { ownerId: "p", toolName: "p_good", spec: spec("good", { handler: async () => ({ n: 7 }) }) },
+    { ownerId: "p", toolName: "p_bad", spec: spec("bad", { handler: () => { throw new Error("boom"); } }) },
+  ]);
+  const good = await server.calls[0].handler({});
+  assert.deepEqual(good.structuredContent, { n: 7 });
+  assert.equal(good.isError, undefined);
+  const bad = await server.calls[1].handler({});
+  assert.equal(bad.isError, true);
+  assert.match(bad.content[0].text, /boom/);
+});
+
+test("stale owner (publisher unloaded) fails cleanly without invoking the handler", async () => {
+  const server = fakeServer();
+  let invoked = false;
+  registerExternalTools(server, fakeApp([]), [
+    { ownerId: "gone", toolName: "gone_t", spec: spec("t", { handler: () => { invoked = true; } }) },
+  ]);
+  const res = await server.calls[0].handler({});
+  assert.equal(res.isError, true);
+  assert.match(res.content[0].text, /no longer loaded/);
+  assert.equal(invoked, false);
+});
