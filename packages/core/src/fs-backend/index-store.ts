@@ -153,11 +153,15 @@ function coerceScalar(raw: string): FrontmatterValue {
   const trimmed = raw.trim();
   if (trimmed === "true") return true;
   if (trimmed === "false") return false;
-  if (/^-?\d+$/.test(trimmed)) {
+  // Preserve leading-zero forms as strings (e.g. "03.05", "007") — coercing
+  // them to numbers would strip the leading zero and break JD-ID lookups like
+  // "03.05" → 3.05, which then misses the "03.05" key in byJdId.
+  const hasLeadingZero = /^-?0\d/.test(trimmed);
+  if (!hasLeadingZero && /^-?\d+$/.test(trimmed)) {
     const n = parseInt(trimmed, 10);
     if (Number.isSafeInteger(n)) return n;
   }
-  if (/^-?\d+\.\d+$/.test(trimmed)) {
+  if (!hasLeadingZero && /^-?\d+\.\d+$/.test(trimmed)) {
     const n = parseFloat(trimmed);
     if (Number.isFinite(n)) return n;
   }
@@ -330,8 +334,15 @@ function _addToForwardMaps(s: IndexState, note: IndexedNote): void {
         `[index] duplicate jd-id '${note.jdId}' — '${existing.path}' vs '${note.path}'. ` +
           `Second occurrence wins; JD invariant violation worth investigating.`
       );
+      // Use the same tiebreak as buildIndex: notes are processed in lexical
+      // path order, so the lexically-later path is the winner. Only overwrite
+      // when the new note's path sorts after the existing winner's path.
+      if (note.path > existing.path) {
+        s.byJdId.set(note.jdId, note);
+      }
+    } else {
+      s.byJdId.set(note.jdId, note);
     }
-    s.byJdId.set(note.jdId, note);
   }
 
   for (const [rawProp, value] of Object.entries(note.frontmatter)) {
