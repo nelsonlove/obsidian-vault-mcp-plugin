@@ -109,6 +109,40 @@ export function buildFront(deps: FrontDeps): express.Express {
   return app;
 }
 
+// ── Presence-to-LIVE-proxy failover wiring ────────────────────────────────────
+//
+// Notifies open SSE channels (best-effort) that the tool surface changed, then
+// tears down LIVE sessions when Obsidian closes.  New requests auto-route to FS
+// mode via the request-time presence.isLive() check already in buildFront.
+// FS-mode and POST-only clients discover the new surface on their next
+// initialize (seamless push is Phase 2b).
+
+const LIST_CHANGED = {
+  jsonrpc: "2.0",
+  method: "notifications/tools/list_changed",
+  params: {},
+} as const;
+
+export function wireFailover(deps: {
+  presence: { on(ev: "up" | "down", cb: () => void): void };
+  live: { teardownAll(): void; notifyAll(msg: object): void };
+}): void {
+  const { presence, live } = deps;
+
+  // When Obsidian closes: push list_changed to any open SSE channels, then
+  // tear down live sessions (their plugin backend is gone).
+  presence.on("down", () => {
+    live.notifyAll(LIST_CHANGED);
+    live.teardownAll();
+  });
+
+  // When Obsidian comes back: best-effort nudge; new connects resolve to LIVE
+  // via the request-time isLive() check.  Do NOT tear down existing sessions.
+  presence.on("up", () => {
+    live.notifyAll(LIST_CHANGED);
+  });
+}
+
 // ── Socket path resolution ────────────────────────────────────────────────────
 //
 // The plugin writes its Unix socket at `~/.claude/vault-mcp/<slug>.sock` where
@@ -199,6 +233,7 @@ if (process.argv[1] && path.resolve(process.argv[1]) === _thisFile) {
   const app = buildFront({ cfg, token: TOKEN, presence, fs: fsHandler, live: liveProxy });
 
   presence.start();
+  wireFailover({ presence, live: liveProxy });
 
   fsHandler.ready().catch((e: unknown) => {
     console.error(

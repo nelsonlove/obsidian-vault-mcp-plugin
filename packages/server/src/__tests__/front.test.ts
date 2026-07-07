@@ -16,7 +16,7 @@ import { test, describe, before, after } from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
 import type express from "express";
-import { buildFront } from "../front.js";
+import { buildFront, wireFailover } from "../front.js";
 import type { AuthConfig } from "../auth.js";
 
 // ── Auth config — static-token only (enabled=false) ──────────────────────────
@@ -183,5 +183,91 @@ describe("buildFront", () => {
     assert.equal(resp.status, 200);
     body = (await resp.json()) as { status: string; mode: string; authEnabled: boolean };
     assert.equal(body.mode, "fs", "mode must flip to 'fs' when presence.isLive()===false");
+  });
+});
+
+// ── wireFailover ──────────────────────────────────────────────────────────────
+//
+// Stubs: a presence stub that records callbacks so tests can fire them, and a
+// live stub with teardownAll/notifyAll spies.
+
+describe("wireFailover", () => {
+  // Presence stub: records registered callbacks by event name; fire() dispatches them.
+  function makePresenceStub() {
+    const cbs: Record<string, Array<() => void>> = {};
+    return {
+      on(ev: "up" | "down", cb: () => void): void {
+        (cbs[ev] ??= []).push(cb);
+      },
+      fire(ev: "up" | "down"): void {
+        for (const cb of cbs[ev] ?? []) cb();
+      },
+    };
+  }
+
+  // Live stub: records call order and captures the last message sent to notifyAll.
+  function makeLiveStub() {
+    const calls: string[] = [];
+    let lastMsg: object | null = null;
+    return {
+      calls,
+      get lastMsg(): object | null {
+        return lastMsg;
+      },
+      notifyAll(msg: object): void {
+        calls.push("notifyAll");
+        lastMsg = msg;
+      },
+      teardownAll(): void {
+        calls.push("teardownAll");
+      },
+    };
+  }
+
+  // ── 5. "down" → notifyAll(LIST_CHANGED) then teardownAll ──────────────────
+
+  test('"down" calls live.notifyAll(LIST_CHANGED) then live.teardownAll()', () => {
+    const presence = makePresenceStub();
+    const live = makeLiveStub();
+
+    wireFailover({ presence, live });
+    presence.fire("down");
+
+    assert.deepEqual(
+      live.calls,
+      ["notifyAll", "teardownAll"],
+      "notifyAll must be called before teardownAll",
+    );
+    assert.equal(
+      (live.lastMsg as { method?: string } | null)?.method,
+      "notifications/tools/list_changed",
+      "notifyAll must receive a notifications/tools/list_changed message",
+    );
+  });
+
+  // ── 6. "up" → notifyAll(LIST_CHANGED) only, teardownAll NOT called ────────
+
+  test('"up" calls live.notifyAll(LIST_CHANGED) and does NOT call teardownAll', () => {
+    const presence = makePresenceStub();
+    const live = makeLiveStub();
+
+    wireFailover({ presence, live });
+    presence.fire("up");
+
+    assert.equal(
+      live.calls.filter((c) => c === "notifyAll").length,
+      1,
+      "notifyAll must be called exactly once on up",
+    );
+    assert.equal(
+      live.calls.filter((c) => c === "teardownAll").length,
+      0,
+      "teardownAll must NOT be called on up",
+    );
+    assert.equal(
+      (live.lastMsg as { method?: string } | null)?.method,
+      "notifications/tools/list_changed",
+      "notifyAll must receive a notifications/tools/list_changed message",
+    );
   });
 });
