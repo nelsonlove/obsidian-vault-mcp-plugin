@@ -3,6 +3,17 @@ import { posix } from "node:path";
 import { ok } from "@vault-mcp/core";
 export { ok, fail } from "@vault-mcp/core";
 
+/**
+ * Extract path keys from a `getBacklinksForFile()` data payload. Obsidian
+ * builds differ: some return a `Map<string, …>`, others return a plain object.
+ * Handles both shapes defensively so `getBacklinks` never throws.
+ */
+export function backlinkKeys(data: unknown): string[] {
+  if (data instanceof Map) return [...(data as Map<string, unknown>).keys()];
+  if (data !== null && data !== undefined && typeof data === "object") return Object.keys(data);
+  return [];
+}
+
 // ok()'s shape plus the MCP error flag: for batch tools whose structured
 // per-item report must survive a total failure (fail() would flatten it to text).
 export function okError(data: unknown) {
