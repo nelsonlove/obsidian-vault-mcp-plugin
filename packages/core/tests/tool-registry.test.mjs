@@ -84,10 +84,13 @@ test("obsidian_patch_note, obsidian_write_note, obsidian_move_note have DESTRUCT
   }
 });
 
-test("obsidian_force_reindex has readOnlyHint=false, destructiveHint=false, idempotentHint=true", () => {
+test("obsidian_force_reindex is read-only (rebuilds in-memory index, never mutates vault data)", () => {
   const tool = FS_TOOLS.find((t) => t.name === "obsidian_force_reindex");
   assert.ok(tool, "obsidian_force_reindex not found in FS_TOOLS");
-  assert.equal(tool.annotations.readOnlyHint, false);
+  // reindex is read-only: it reads the vault and rebuilds the in-memory index,
+  // but never writes or modifies vault data. This must be true so the plugin's
+  // guardCall does not block it in read-only mode.
+  assert.equal(tool.annotations.readOnlyHint, true, "reindex must be readOnlyHint:true — it never mutates vault data");
   assert.equal(tool.annotations.destructiveHint, false);
   assert.equal(tool.annotations.idempotentHint, true);
   assert.equal(tool.annotations.openWorldHint, false);

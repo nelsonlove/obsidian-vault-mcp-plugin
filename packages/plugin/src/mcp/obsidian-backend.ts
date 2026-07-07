@@ -7,6 +7,7 @@
  */
 
 import { TFile, TFolder, getAllTags, type App } from "obsidian";
+import { CHARACTER_LIMIT } from "@vault-mcp/core";
 import type {
   VaultBackend,
   NoteRef,
@@ -20,11 +21,6 @@ import type {
   PatchAnchor,
   PatchOp,
 } from "@vault-mcp/core";
-
-// ── Shared constants / helpers ────────────────────────────────────────────────
-
-/** Matches the per-note character limit used by the shared registry handler. */
-const CHARACTER_LIMIT = 100_000;
 
 function countMarkdownRecursive(folder: TFolder): number {
   let n = 0;
@@ -88,25 +84,14 @@ export class ObsidianBackend implements VaultBackend {
   async readNote(relPath: string): Promise<string> {
     const f = this.app.vault.getAbstractFileByPath(relPath);
     if (!(f instanceof TFile)) throw new Error(`not found: ${relPath}`);
-    // No truncation: the live cache is authoritative and callers of readNote
-    // may need the full content. The `truncated` flag in obsidian_read_notes
-    // fires when content.length > CHARACTER_LIMIT even without truncation
-    // (matching the original plugin's behavior).
-    return this.app.vault.read(f);
-  }
-
-  async readNotes(paths: string[]): Promise<{ results: Array<{ path: string; content: string } | { path: string; error: string }> }> {
-    const results = await Promise.all(
-      paths.map(async (p) => {
-        try {
-          const content = await this.readNote(p);
-          return { path: p, content };
-        } catch (e) {
-          return { path: p, error: e instanceof Error ? e.message : String(e) };
-        }
-      })
-    );
-    return { results };
+    const content = await this.app.vault.read(f);
+    if (content.length > CHARACTER_LIMIT) {
+      return (
+        content.slice(0, CHARACTER_LIMIT) +
+        `\n\n[truncated: note is ${content.length} chars, showing first ${CHARACTER_LIMIT}]`
+      );
+    }
+    return content;
   }
 
   // ── search ──────────────────────────────────────────────────────────────────
@@ -170,14 +155,54 @@ export class ObsidianBackend implements VaultBackend {
     // provide it get the context-aware result; fall back to "" (vault-root
     // context) when omitted.
     return refs.map((ref): ResolveResult => {
-      const stripped = ref.replace(/^\[\[/, "").replace(/\]\]$/, "").split("|")[0];
-      const fragmentIdx = stripped.indexOf("#");
-      const clean = fragmentIdx >= 0 ? stripped.slice(0, fragmentIdx) : stripped;
-      const fragment = fragmentIdx >= 0 ? stripped.slice(fragmentIdx + 1) : undefined;
+      // Strip [[ ]] wrapping then extract display alias (|Alias) and fragment (#...).
+      let working = ref.replace(/^\[\[/, "").replace(/\]\]$/, "");
+
+      let alias: string | undefined;
+      const pipeIdx = working.indexOf("|");
+      if (pipeIdx >= 0) {
+        alias = working.slice(pipeIdx + 1).trim() || undefined;
+        working = working.slice(0, pipeIdx);
+      }
+
+      const fragmentIdx = working.indexOf("#");
+      const clean = fragmentIdx >= 0 ? working.slice(0, fragmentIdx) : working;
+      const fragment = fragmentIdx >= 0 ? working.slice(fragmentIdx + 1) : undefined;
+
       const dest = this.app.metadataCache.getFirstLinkpathDest(clean, from ?? "");
-      return dest
-        ? { ref, path: dest.path, ...(fragment ? { fragment } : {}) }
-        : { ref, ...(fragment ? { fragment } : {}) };
+      if (!dest) {
+        return {
+          ref,
+          ...(fragment ? { fragment } : {}),
+          ...(alias ? { alias } : {}),
+        };
+      }
+
+      // Determine matched_by — mirrors the discriminants used by index-store._resolveRefs
+      // so both backends emit the same vocabulary: "path" | "basename" | "alias" | "jd-id".
+      let matched_by: ResolveResult["matched_by"];
+      if (clean === dest.path || clean + ".md" === dest.path) {
+        matched_by = "path";
+      } else {
+        const fm = this.app.metadataCache.getFileCache(dest)?.frontmatter;
+        const jdId = fm ? fm["jd-id"] : undefined;
+        if (jdId !== undefined && String(jdId) === clean) {
+          matched_by = "jd-id";
+        } else if (dest.basename.toLowerCase() === clean.toLowerCase()) {
+          matched_by = "basename";
+        } else {
+          // Obsidian resolved via alias (or another indirect match)
+          matched_by = "alias";
+        }
+      }
+
+      return {
+        ref,
+        path: dest.path,
+        matched_by,
+        ...(fragment ? { fragment } : {}),
+        ...(alias ? { alias } : {}),
+      };
     });
   }
 

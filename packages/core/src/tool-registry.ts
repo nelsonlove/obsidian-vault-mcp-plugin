@@ -269,8 +269,9 @@ export const FS_TOOLS: ToolDef[] = [
       "Call this when you need to wait synchronously before a follow-up index query (tight read-after-write loop). " +
       "Concurrent callers share a single in-flight rebuild where supported. Idempotent.",
     inputSchema: {},
-    // Not read-only (mutates the index), but idempotent.
-    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    // Read-only: reindex reads the vault and rebuilds the in-memory index but
+    // never mutates vault data. Idempotent (repeated calls are safe).
+    annotations: RO,
     capability: "fs-expressible",
   },
 

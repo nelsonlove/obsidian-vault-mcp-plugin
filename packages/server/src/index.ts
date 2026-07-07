@@ -65,19 +65,6 @@ function makeBackend(): VaultBackend {
 
     readNote: (relPath) => readNote(relPath),
 
-    readNotes: async (paths) => {
-      const results = await Promise.all(
-        paths.map(async (p) => {
-          try {
-            return { path: p, content: await readNote(p) } as const;
-          } catch (e) {
-            return { path: p, error: e instanceof Error ? e.message : String(e) } as const;
-          }
-        }),
-      );
-      return { results };
-    },
-
     searchNotes: (query, limit, mode) => searchNotes(query, limit, mode),
 
     findByTag: (tag, limit) => findByTag(tag, limit),

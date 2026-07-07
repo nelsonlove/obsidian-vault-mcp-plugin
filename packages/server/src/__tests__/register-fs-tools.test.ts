@@ -21,13 +21,13 @@ import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import {
   FS_TOOLS,
   registerFsTools,
+  CHARACTER_LIMIT,
 } from "@vault-mcp/core";
 import type {
   VaultBackend,
   NoteRef,
   SearchHit,
   SearchMode,
-  ReadNotesResult,
   ResolveResult,
   OutlinkEntry,
   FrontmatterSearchResult,
@@ -63,19 +63,6 @@ class FakeVaultBackend implements VaultBackend {
     const content = this.notes.get(relPath);
     if (content === undefined) throw new Error(`not found: ${relPath}`);
     return content;
-  }
-
-  async readNotes(paths: string[]): Promise<ReadNotesResult> {
-    const results = await Promise.all(
-      paths.map(async (p) => {
-        try {
-          return { path: p, content: await this.readNote(p) };
-        } catch (e) {
-          return { path: p, error: e instanceof Error ? e.message : String(e) };
-        }
-      }),
-    );
-    return { results };
   }
 
   async searchNotes(_query: string, _limit: number, _mode: SearchMode): Promise<SearchHit[]> {
@@ -435,5 +422,128 @@ describe("registerFsTools", () => {
     } finally {
       await teardown();
     }
+  });
+
+  // ── Fix verification tests ───────────────────────────────────────────────────
+
+  // (a) readNote truncation at CHARACTER_LIMIT is truthful
+  test("obsidian_read_notes: truncated:true is accurate — content is capped at CHARACTER_LIMIT with trailer", async () => {
+    // Simulates what ObsidianBackend.readNote now does: truncate large notes and
+    // append the same trailer as the FS backend. Verifies that the handler's
+    // `content.length > CHARACTER_LIMIT` check fires truthfully — i.e., the
+    // content returned is actually capped, not full.
+    const rawContent = "x".repeat(CHARACTER_LIMIT + 500); // oversized
+
+    class TruncatingBackend extends FakeVaultBackend {
+      override async readNote(relPath: string): Promise<string> {
+        const content = await super.readNote(relPath);
+        if (content.length > CHARACTER_LIMIT) {
+          return (
+            content.slice(0, CHARACTER_LIMIT) +
+            `\n\n[truncated: note is ${content.length} chars, showing first ${CHARACTER_LIMIT}]`
+          );
+        }
+        return content;
+      }
+    }
+
+    const backend = new TruncatingBackend();
+    await backend.writeNote("Big.md", rawContent, true);
+    const { client, teardown } = await makeClientServer(backend);
+    try {
+      const result = await client.callTool({
+        name: "obsidian_read_notes",
+        arguments: { paths: ["Big.md"] },
+      });
+      assert.ok(!result.isError, `unexpected error: ${JSON.stringify(result.content)}`);
+      const data = JSON.parse((result.content as Array<{ type: string; text: string }>)[0].text);
+      assert.equal(data.notes.length, 1);
+      const note = data.notes[0];
+      // truncated: true must be set AND content must be genuinely capped
+      assert.equal(note.truncated, true, "truncated must be true for oversized content");
+      assert.ok(
+        note.content.length <= CHARACTER_LIMIT + 200, // room for trailer text
+        `content should be capped near CHARACTER_LIMIT, got ${note.content.length} chars`,
+      );
+      assert.ok(
+        note.content.includes("[truncated:"),
+        "trailer marker must be present in truncated content",
+      );
+      // The original oversized content must NOT appear in full
+      assert.ok(
+        !note.content.includes("x".repeat(CHARACTER_LIMIT + 500)),
+        "full oversized content must not appear (must be truncated)",
+      );
+    } finally {
+      await teardown();
+    }
+  });
+
+  // (b) resolve passes through alias field from backend
+  test("obsidian_resolve: alias and matched_by from backend are preserved in resolved response", async () => {
+    // Verifies that register-fs-tools correctly passes through ResolveResult fields
+    // including alias (set by ObsidianBackend.resolve when the ref has |display alias)
+    // and matched_by. Uses a custom backend returning these fields.
+    class AliasingBackend extends FakeVaultBackend {
+      override async resolve(_refs: string[], _from?: string): Promise<ResolveResult[]> {
+        return [
+          {
+            ref: "[[Note|Display Alias]]",
+            path: "Notes/Note.md",
+            matched_by: "basename",
+            alias: "Display Alias",
+          },
+        ];
+      }
+    }
+
+    const backend = new AliasingBackend();
+    const { client, teardown } = await makeClientServer(backend);
+    try {
+      const result = await client.callTool({
+        name: "obsidian_resolve",
+        arguments: { refs: ["[[Note|Display Alias]]"] },
+      });
+      assert.ok(!result.isError, `unexpected error: ${JSON.stringify(result.content)}`);
+      const data = JSON.parse((result.content as Array<{ type: string; text: string }>)[0].text);
+      assert.equal(data.resolved.length, 1, "should have one resolved entry");
+      const r = data.resolved[0];
+      assert.equal(r.alias, "Display Alias", "alias must be preserved in resolved entry");
+      assert.equal(r.matched_by, "basename", "matched_by must be preserved in resolved entry");
+      assert.equal(r.path, "Notes/Note.md");
+    } finally {
+      await teardown();
+    }
+  });
+
+  // (d) move_note success response includes moved:true
+  test("obsidian_move_note response includes moved:true", async () => {
+    const backend = new FakeVaultBackend();
+    await backend.writeNote("Old.md", "# Old", true);
+    const { client, teardown } = await makeClientServer(backend);
+    try {
+      const result = await client.callTool({
+        name: "obsidian_move_note",
+        arguments: { from: "Old.md", to: "New.md", update_backlinks: true, overwrite: false },
+      });
+      assert.ok(!result.isError, `unexpected error: ${JSON.stringify(result.content)}`);
+      const data = JSON.parse((result.content as Array<{ type: string; text: string }>)[0].text);
+      assert.equal(data.from, "Old.md");
+      assert.equal(data.to, "New.md");
+      assert.equal(data.moved, true, "moved:true must be present in move_note success response");
+    } finally {
+      await teardown();
+    }
+  });
+
+  // (e) VaultBackend interface has no readNotes method — call sites must be absent
+  test("VaultBackend interface has no readNotes method — FakeVaultBackend must not implement it", () => {
+    // Structural guard: readNotes was removed from VaultBackend (FIX 5). Verify
+    // that neither FakeVaultBackend nor any backend inadvertently re-introduces it.
+    const backend = new FakeVaultBackend();
+    assert.ok(
+      !("readNotes" in backend),
+      "FakeVaultBackend must not have readNotes — it was removed from VaultBackend interface",
+    );
   });
 });

@@ -397,7 +397,7 @@ function makeHandler(
           // operation but cannot determine the count" (e.g. the live Obsidian backend
           // uses renameFile which rewrites backlinks internally). Omit null fields
           // rather than emitting a misleading 0.
-          const resp: Record<string, unknown> = { from: r.from, to: r.to };
+          const resp: Record<string, unknown> = { from: r.from, to: r.to, moved: true };
           if (r.backlinks_updated !== null) resp.backlinks_updated = r.backlinks_updated;
           if (r.backlinks_files_touched !== null) resp.backlinks_files_touched = r.backlinks_files_touched;
           return ok(status(resp));

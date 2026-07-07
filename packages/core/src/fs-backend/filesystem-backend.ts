@@ -5,7 +5,6 @@ import type {
   NoteRef,
   SearchHit,
   SearchMode,
-  ReadNotesResult,
   PatchAnchor,
   PatchOp,
   ResolveResult,
@@ -62,20 +61,6 @@ export class FilesystemBackend implements VaultBackend {
 
   async readNote(relPath: string): Promise<string> {
     return this.vault.readNote(relPath);
-  }
-
-  async readNotes(paths: string[]): Promise<ReadNotesResult> {
-    const results = await Promise.all(
-      paths.map(async (p) => {
-        try {
-          const content = await this.vault.readNote(p);
-          return { path: p, content } as const;
-        } catch (e) {
-          return { path: p, error: e instanceof Error ? e.message : String(e) } as const;
-        }
-      })
-    );
-    return { results };
   }
 
   // ── Read: search ───────────────────────────────────────────────────────────

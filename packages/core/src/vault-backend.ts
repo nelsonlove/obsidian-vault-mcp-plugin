@@ -172,13 +172,6 @@ export interface VaultBackend {
    */
   readNote(relPath: string): Promise<string>;
 
-  /**
-   * Read multiple notes in one call.
-   * Missing or unreadable paths appear as ReadNoteError entries; the call
-   * itself never throws for partial failures.
-   */
-  readNotes(paths: string[]): Promise<ReadNotesResult>;
-
   // ── Read: search ───────────────────────────────────────────────────────────
 
   /**
