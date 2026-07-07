@@ -10,13 +10,13 @@ import path from "node:path";
 // behind a symlink — which exercises the realpath comparison for free.
 let tmpRoot: string;
 let outsideRoot: string;
-let vault: typeof import("../vault.js");
+let vault: typeof import("../src/fs-backend/vault.js");
 
 before(async () => {
   tmpRoot = await mkdtemp(path.join(tmpdir(), "vault-test-"));
   outsideRoot = await mkdtemp(path.join(tmpdir(), "vault-outside-"));
   process.env.VAULT_PATH = tmpRoot;
-  vault = await import("../vault.js");
+  vault = await import("../src/fs-backend/vault.js");
 });
 
 beforeEach(async () => {

@@ -19,23 +19,22 @@ import {
   deleteNote,
   moveNote,
   listFolders,
-} from "./vault.js";
-import {
-  loadAuthConfig,
-  protectedResourceMetadata,
-  prmPath,
-  requireBearer,
-} from "./auth.js";
-import {
   buildIndex,
   indexStatus,
   resolveRefs,
   getBacklinks,
   getOutlinks,
   searchByFrontmatter,
-} from "./index-store.js";
-import { startVaultWatcher } from "./vault-watcher.js";
-import { ok, fail } from "@vault-mcp/core";
+  startVaultWatcher,
+  ok,
+  fail,
+} from "@vault-mcp/core";
+import {
+  loadAuthConfig,
+  protectedResourceMetadata,
+  prmPath,
+  requireBearer,
+} from "./auth.js";
 
 /**
  * obsidian-vault-mcp-server

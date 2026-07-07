@@ -17,7 +17,7 @@ import os from "node:os";
 
 let tmpRoot: string;
 // Imports happen after VAULT_PATH is set in `before` — see below.
-type IndexStoreModule = typeof import("../index-store.js");
+type IndexStoreModule = typeof import("../src/fs-backend/index-store.js");
 let indexStore: IndexStoreModule;
 
 before(async () => {
@@ -25,7 +25,7 @@ before(async () => {
   process.env.VAULT_PATH = tmpRoot;
   // Dynamic import AFTER env is set — vault.ts captures VAULT_PATH at module
   // load time as a const, so the env must be set first.
-  indexStore = await import("../index-store.js");
+  indexStore = await import("../src/fs-backend/index-store.js");
 });
 
 after(async () => {
