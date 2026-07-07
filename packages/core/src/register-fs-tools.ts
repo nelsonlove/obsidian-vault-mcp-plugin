@@ -63,8 +63,6 @@ export function registerFsTools(server: any, backend: VaultBackend, opts: Regist
   const { decodeHtml = false, includeIndexStatus } = opts;
 
   const dec = (s: string): string => (decodeHtml ? decodeHtmlEntities(s) : s);
-  const status = (): { index_status: IndexStatusSnapshot } | Record<string, never> =>
-    includeIndexStatus ? { index_status: includeIndexStatus() } : {};
 
   for (const tool of FS_TOOLS) {
     const handler = makeHandler(tool.name, backend, dec, includeIndexStatus);
@@ -79,9 +77,6 @@ export function registerFsTools(server: any, backend: VaultBackend, opts: Regist
       handler,
     );
   }
-
-  // status is used only inside makeHandler; reference it to satisfy TS.
-  void status;
 }
 
 // ── Per-tool handler factory ──────────────────────────────────────────────────

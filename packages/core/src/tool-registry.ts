@@ -335,7 +335,7 @@ export const FS_TOOLS: ToolDef[] = [
     name: "obsidian_write_note",
     title: "Write a note",
     description:
-      "Create a note, or overwrite an existing one when overwrite=true. Path must end in .md. Parent folders are created as needed. Writes propagate to your other devices via Obsidian Sync.",
+      "Create a note, or overwrite an existing one when overwrite=true. Path must end in .md. Parent folders are created as needed.",
     inputSchema: {
       path: z.string().min(1).describe("Vault-relative path ending in .md."),
       content: z.string().describe("Full markdown content to write."),
@@ -387,7 +387,7 @@ export const FS_TOOLS: ToolDef[] = [
     name: "obsidian_delete_note",
     title: "Delete a note from the vault",
     description:
-      "Permanently delete a note from disk. The change propagates to your other devices via Obsidian Sync — this is a one-way operation with no undo. " +
+      "Permanently delete a note from disk. This is a one-way operation with no undo. " +
       "To make accidents harder: `confirm: true` is required at the schema layer. Calls without it are rejected before reaching the filesystem. " +
       "Backlinks to the deleted note are NOT updated — those refs become 'broken' and can be detected with the existing tooling. Use `obsidian_move_note` if you want to relocate while preserving wikilinks.",
     inputSchema: {
