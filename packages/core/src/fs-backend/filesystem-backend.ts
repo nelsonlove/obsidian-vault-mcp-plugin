@@ -95,7 +95,10 @@ export class FilesystemBackend implements VaultBackend {
 
   // ── Read: link resolution ──────────────────────────────────────────────────
 
-  async resolve(refs: string[]): Promise<ResolveResult[]> {
+  async resolve(refs: string[], _from?: string): Promise<ResolveResult[]> {
+    // `from` is accepted for interface parity but ignored by the filesystem
+    // backend: the index-based resolver does not yet perform source-note-aware
+    // disambiguation. Callers on the FS backend get best-effort resolution.
     return this.index.resolveRefs(refs);
   }
 

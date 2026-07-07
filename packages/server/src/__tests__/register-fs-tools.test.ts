@@ -42,6 +42,12 @@ import type {
 class FakeVaultBackend implements VaultBackend {
   private notes: Map<string, string> = new Map();
   reindexCalled = 0;
+  /**
+   * When true, moveNote returns null for both backlink-count fields (simulating
+   * the live Obsidian backend that can't cheaply count rewrites). When false
+   * (default), returns realistic non-zero counts to exercise the FS path.
+   */
+  nullCounts = false;
 
   async listNotes(_subdir?: string, limit = 100, offset = 0): Promise<{ total: number; notes: NoteRef[] }> {
     const all = [...this.notes.keys()].sort();
@@ -84,7 +90,7 @@ class FakeVaultBackend implements VaultBackend {
     return [];
   }
 
-  async resolve(refs: string[]): Promise<ResolveResult[]> {
+  async resolve(refs: string[], _from?: string): Promise<ResolveResult[]> {
     return refs.map((ref) => ({ ref }));
   }
 
@@ -138,12 +144,19 @@ class FakeVaultBackend implements VaultBackend {
     fromRel: string,
     toRel: string,
     _options: { update_backlinks: boolean; overwrite: boolean },
-  ): Promise<{ from: string; to: string; backlinks_updated: number; backlinks_files_touched: number }> {
+  ): Promise<{ from: string; to: string; backlinks_updated: number | null; backlinks_files_touched: number | null }> {
     const content = this.notes.get(fromRel);
     if (content === undefined) throw new Error(`not found: ${fromRel}`);
     this.notes.delete(fromRel);
     this.notes.set(toRel, content);
-    return { from: fromRel, to: toRel, backlinks_updated: 0, backlinks_files_touched: 0 };
+    // nullCounts=true simulates the live Obsidian backend (can't count rewrites).
+    // nullCounts=false (default) simulates the FS backend with real counts.
+    return {
+      from: fromRel,
+      to: toRel,
+      backlinks_updated: this.nullCounts ? null : 3,
+      backlinks_files_touched: this.nullCounts ? null : 2,
+    };
   }
 
   async deleteNote(relPath: string, _confirm: true): Promise<{ path: string; deleted: true }> {
@@ -339,6 +352,70 @@ describe("registerFsTools", () => {
       const result = await client.callTool({ name: "obsidian_read_note", arguments: { path: "Missing.md" } });
       // The server uses fail() which sets isError: true
       assert.ok(result.isError === true, "expected isError for missing note");
+    } finally {
+      await teardown();
+    }
+  });
+
+  test("obsidian_move_note with numeric counts includes them in response (FS backend path)", async () => {
+    const backend = new FakeVaultBackend();
+    await backend.writeNote("Source.md", "# Source", true);
+    const { client, teardown } = await makeClientServer(backend);
+    try {
+      const result = await client.callTool({
+        name: "obsidian_move_note",
+        arguments: { from: "Source.md", to: "Dest.md", update_backlinks: true, overwrite: false },
+      });
+      assert.ok(!result.isError, `unexpected error: ${JSON.stringify(result.content)}`);
+      const data = JSON.parse((result.content as Array<{ type: string; text: string }>)[0].text);
+      assert.equal(data.from, "Source.md");
+      assert.equal(data.to, "Dest.md");
+      // FS backend returns real numeric counts — they must appear in the response.
+      assert.ok("backlinks_updated" in data, "backlinks_updated should be present for numeric-count backend");
+      assert.ok("backlinks_files_touched" in data, "backlinks_files_touched should be present for numeric-count backend");
+      assert.equal(data.backlinks_updated, 3);
+      assert.equal(data.backlinks_files_touched, 2);
+    } finally {
+      await teardown();
+    }
+  });
+
+  test("obsidian_move_note with null counts omits them from response (live Obsidian backend path)", async () => {
+    const backend = new FakeVaultBackend();
+    backend.nullCounts = true; // simulate live Obsidian backend
+    await backend.writeNote("A.md", "# A", true);
+    const { client, teardown } = await makeClientServer(backend);
+    try {
+      const result = await client.callTool({
+        name: "obsidian_move_note",
+        arguments: { from: "A.md", to: "B.md", update_backlinks: true, overwrite: false },
+      });
+      assert.ok(!result.isError, `unexpected error: ${JSON.stringify(result.content)}`);
+      const data = JSON.parse((result.content as Array<{ type: string; text: string }>)[0].text);
+      assert.equal(data.from, "A.md");
+      assert.equal(data.to, "B.md");
+      // Live backend can't count rewrites — these fields must be ABSENT (not 0).
+      assert.ok(!("backlinks_updated" in data), "backlinks_updated must be absent when count is unknown");
+      assert.ok(!("backlinks_files_touched" in data), "backlinks_files_touched must be absent when count is unknown");
+    } finally {
+      await teardown();
+    }
+  });
+
+  test("obsidian_force_reindex without includeIndexStatus returns live-cache shape", async () => {
+    // Simulates the live Obsidian plugin path (no persistent index, includeIndexStatus omitted).
+    const backend = new FakeVaultBackend();
+    const { client, teardown } = await makeClientServer(backend); // no statusFn
+    try {
+      const result = await client.callTool({ name: "obsidian_force_reindex", arguments: {} });
+      assert.ok(!result.isError, `unexpected error: ${JSON.stringify(result.content)}`);
+      const data = JSON.parse((result.content as Array<{ type: string; text: string }>)[0].text);
+      assert.equal(data.status, "live", "status should be 'live' for the live-cache path");
+      assert.ok("duration_ms" in data, "duration_ms should be present");
+      assert.ok(typeof data.duration_ms === "number", "duration_ms should be a number");
+      // Misleading count fields must be absent on the live path.
+      assert.ok(!("prev_count" in data), "prev_count must be absent on live-cache path");
+      assert.ok(!("count" in data), "count must be absent on live-cache path");
     } finally {
       await teardown();
     }

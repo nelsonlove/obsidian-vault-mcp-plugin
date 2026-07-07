@@ -222,7 +222,7 @@ export const FS_TOOLS: ToolDef[] = [
         .string()
         .optional()
         .describe(
-          "Optional vault-relative path of the note containing the references (context for relative-link disambiguation). Best-effort: honored by the live Obsidian backend, ignored by the filesystem backend for now."
+          "Optional vault-relative path of the note containing the references (context for relative-link disambiguation). Honored by the live Obsidian backend (passed to getFirstLinkpathDest for folder-aware resolution); ignored by the filesystem backend (best-effort, resolved without source-note context)."
         ),
     },
     annotations: RO,
@@ -373,7 +373,11 @@ export const FS_TOOLS: ToolDef[] = [
       update_backlinks: z
         .boolean()
         .default(true)
-        .describe("Rewrite [[wikilinks]] in other notes that currently resolve to `from`."),
+        .describe(
+          "Rewrite [[wikilinks]] in other notes that currently resolve to `from`. " +
+          "Advisory on the live Obsidian backend: `renameFile` always rewrites backlinks regardless of this value (Obsidian has no rename-without-rewrite API). " +
+          "Fully honoured by the filesystem backend."
+        ),
       overwrite: z
         .boolean()
         .default(false)

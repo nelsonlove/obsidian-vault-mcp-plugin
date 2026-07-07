@@ -216,14 +216,14 @@ function makeHandler(
 
     // ── obsidian_resolve ───────────────────────────────────────────────────
     case "obsidian_resolve":
-      return async ({ refs, from: _from }: { refs: string[]; from?: string }) => {
-        // `from` (context for relative-link disambiguation) is accepted by the schema
-        // but not forwarded to the FS backend — folder-relative resolution is a
-        // documented follow-up. Graceful degradation: the FS backend resolves refs
-        // without source-note context.
+      return async ({ refs, from }: { refs: string[]; from?: string }) => {
+        // `from` is forwarded to backend.resolve so the live Obsidian backend can
+        // pass it to getFirstLinkpathDest for context-sensitive disambiguation.
+        // The filesystem backend accepts but ignores it (best-effort).
         try {
           const decoded = refs.map(dec);
-          const results = await backend.resolve(decoded);
+          const decodedFrom = from ? dec(from) : undefined;
+          const results = await backend.resolve(decoded, decodedFrom);
           const resolved = results.filter((r) => r.path !== undefined);
           const ambiguous = results.filter((r) => r.ambiguous !== undefined);
           const unresolved = results.filter((r) => r.path === undefined && r.ambiguous === undefined);
@@ -258,14 +258,20 @@ function makeHandler(
       };
 
     // ── obsidian_force_reindex ─────────────────────────────────────────────
-    // Real synchronous rebuild (not no-op). Returns timing + before/after counts.
     case "obsidian_force_reindex":
       return async () => {
-        const before = includeIndexStatus ? includeIndexStatus() : { status: "unknown", count: 0 };
+        if (!includeIndexStatus) {
+          // Live-cache path (Obsidian plugin): no persistent index to rebuild;
+          // forceReindex() is a no-op. Return a truthful shape that says so.
+          const t0 = Date.now();
+          await backend.forceReindex();
+          return ok({ status: "live", duration_ms: Date.now() - t0 });
+        }
+        // FS server path: real rebuild with before/after counts.
+        const before = includeIndexStatus();
         const t0 = Date.now();
-        // buildIndex catches its own errors; they surface in after.error.
         await backend.forceReindex();
-        const after = includeIndexStatus ? includeIndexStatus() : { status: "ready", count: 0 };
+        const after = includeIndexStatus();
         return ok({
           status: after.status,
           prev_count: before.count,
@@ -387,7 +393,14 @@ function makeHandler(
           const decodedFrom = dec(from);
           const decodedTo = dec(to);
           const r = await backend.moveNote(decodedFrom, decodedTo, { update_backlinks, overwrite });
-          return ok(status({ ...r }));
+          // Backlink count fields are number|null. null means "backend performed the
+          // operation but cannot determine the count" (e.g. the live Obsidian backend
+          // uses renameFile which rewrites backlinks internally). Omit null fields
+          // rather than emitting a misleading 0.
+          const resp: Record<string, unknown> = { from: r.from, to: r.to };
+          if (r.backlinks_updated !== null) resp.backlinks_updated = r.backlinks_updated;
+          if (r.backlinks_files_touched !== null) resp.backlinks_files_touched = r.backlinks_files_touched;
+          return ok(status(resp));
         } catch (e) {
           return fail(e);
         }

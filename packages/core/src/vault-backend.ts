@@ -206,8 +206,13 @@ export interface VaultBackend {
   /**
    * Resolve wikilinks, basenames, or vault-relative paths to canonical paths.
    * Uses Obsidian's resolution rules (path → jd-id → basename → alias).
+   *
+   * The optional `from` parameter provides the vault-relative path of the note
+   * that contains the references, enabling context-sensitive resolution. It is
+   * honored by the live Obsidian backend and ignored (best-effort) by the
+   * filesystem backend.
    */
-  resolve(refs: string[]): Promise<ResolveResult[]>;
+  resolve(refs: string[], from?: string): Promise<ResolveResult[]>;
 
   /**
    * List notes that link to the given note (backlinks).
@@ -279,7 +284,11 @@ export interface VaultBackend {
 
   /**
    * Move or rename a note. Backlinks may optionally be rewritten.
-   * Returns counts of rewritten references and touched files.
+   * Returns counts of rewritten references and touched files, or null for each
+   * field when the backend performed the operation but cannot determine the
+   * count (e.g. the live Obsidian backend delegates to `renameFile` which
+   * rewrites backlinks internally without exposing a count). Callers must treat
+   * null as "unknown, not zero" — the operation still succeeded.
    */
   moveNote(
     fromRel: string,
@@ -288,8 +297,8 @@ export interface VaultBackend {
   ): Promise<{
     from: string;
     to: string;
-    backlinks_updated: number;
-    backlinks_files_touched: number;
+    backlinks_updated: number | null;
+    backlinks_files_touched: number | null;
   }>;
 
   /**

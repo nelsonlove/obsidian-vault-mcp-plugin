@@ -163,16 +163,18 @@ export class ObsidianBackend implements VaultBackend {
 
   // ── link resolution ─────────────────────────────────────────────────────────
 
-  async resolve(refs: string[]): Promise<ResolveResult[]> {
-    // Single-ref Obsidian resolver iterated over each ref. The `from` parameter
-    // is accepted by the FS_TOOLS schema but not forwarded to this method by
-    // registerFsTools (graceful degradation documented in register-fs-tools.ts).
+  async resolve(refs: string[], from?: string): Promise<ResolveResult[]> {
+    // Obsidian's getFirstLinkpathDest(linkpath, sourcePath) uses the source note
+    // path for context-sensitive resolution (e.g. preferring notes in the same
+    // folder for ambiguous basenames). Pass `from` through so callers that
+    // provide it get the context-aware result; fall back to "" (vault-root
+    // context) when omitted.
     return refs.map((ref): ResolveResult => {
       const stripped = ref.replace(/^\[\[/, "").replace(/\]\]$/, "").split("|")[0];
       const fragmentIdx = stripped.indexOf("#");
       const clean = fragmentIdx >= 0 ? stripped.slice(0, fragmentIdx) : stripped;
       const fragment = fragmentIdx >= 0 ? stripped.slice(fragmentIdx + 1) : undefined;
-      const dest = this.app.metadataCache.getFirstLinkpathDest(clean, "");
+      const dest = this.app.metadataCache.getFirstLinkpathDest(clean, from ?? "");
       return dest
         ? { ref, path: dest.path, ...(fragment ? { fragment } : {}) }
         : { ref, ...(fragment ? { fragment } : {}) };
@@ -341,8 +343,8 @@ export class ObsidianBackend implements VaultBackend {
   ): Promise<{
     from: string;
     to: string;
-    backlinks_updated: number;
-    backlinks_files_touched: number;
+    backlinks_updated: number | null;
+    backlinks_files_touched: number | null;
   }> {
     if (!fromRel.endsWith(".md")) throw new Error("source must end in .md");
     if (!toRel.endsWith(".md")) throw new Error("destination must end in .md");
@@ -378,10 +380,10 @@ export class ObsidianBackend implements VaultBackend {
       throw e;
     }
 
-    // We cannot cheaply count the backlinks that Obsidian rewrote, so we
-    // return 0 as a best-effort value. Callers that need the exact count
-    // should query obsidian_get_backlinks before and after the move.
-    return { from: fromRel, to: toRel, backlinks_updated: 0, backlinks_files_touched: 0 };
+    // Obsidian's renameFile rewrites backlinks internally but exposes no count.
+    // Return null to signal "unknown, not zero" — the response layer omits these
+    // fields rather than emitting a misleading 0.
+    return { from: fromRel, to: toRel, backlinks_updated: null, backlinks_files_touched: null };
   }
 
   async deleteNote(relPath: string, confirm: true): Promise<{ path: string; deleted: true }> {
@@ -393,5 +395,3 @@ export class ObsidianBackend implements VaultBackend {
   }
 }
 
-// Re-export CHARACTER_LIMIT for registerFsTools' truncation check.
-export { CHARACTER_LIMIT };
