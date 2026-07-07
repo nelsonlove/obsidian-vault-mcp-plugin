@@ -194,6 +194,10 @@ export interface VaultBackend {
   /**
    * Find notes whose frontmatter property equals a given value.
    * For array-typed properties, matches if any element equals the value.
+   *
+   * Note: this method is intentionally uncapped — it returns all matches from
+   * the index store. Callers at the MCP layer are responsible for applying any
+   * result-set limit before returning results to the client.
    */
   searchByFrontmatter(property: string, value: string): Promise<FrontmatterSearchResult[]>;
 
