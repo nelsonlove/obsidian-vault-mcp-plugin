@@ -41,6 +41,7 @@ See `deploy/REMOTE.md` § 5 for the full env-var reference.
 | `src/live-proxy.ts` | `createLiveProxy` — session factory (bridge.mjs per session) |
 | `src/fs-mode.ts` | `createFsHandler` — stateless FS-mode request handler |
 | `src/auth.ts` | `createAuthGate` + PRM / RFC 9728 helpers |
+| `src/semantic-proxy.ts` | Phase 2b: MCP-semantic proxy — mid-session 44↔17 via `tools/list_changed`; enabled by `VAULT_MCP_SEAMLESS=1` (default OFF) |
 
 ## Deployment
 

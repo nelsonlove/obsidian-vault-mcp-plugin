@@ -168,3 +168,19 @@ Two Clerk realities shaped the wiring:
 
 > Startup is **fail-closed**: refuses to run with no auth at all, and with
 > `AUTH_ENABLED=true` but no allowlist (unless `AUTH_ALLOW_ANY_AUTHENTICATED`).
+
+## Phase 2b — seamless mid-session switching (flag-gated, default OFF)
+
+`VAULT_MCP_SEAMLESS=1` routes `/mcp` through the **MCP-semantic proxy**
+(`src/semantic-proxy.ts`) instead of the Phase 2a passthrough: each session gets
+an in-process MCP server that mirrors the plugin's live tools (forwarding
+`tools/call` over one shared bridge connection) or serves the 17 FS tools, and
+on a presence flip emits `notifications/tools/list_changed` so a connected
+client's tool surface changes 44↔17 **without reconnecting**. With the flag
+unset the behavior is byte-for-byte Phase 2a.
+
+Leave OFF until Phase 2a has a daily-use track record; flipping it on the
+LaunchAgent is a deliberate operator step (add `VAULT_MCP_SEAMLESS=1` to
+`~/.config/vault-mcp-remote/env`, `launchctl unload`/`load`). The semantic
+proxy honors the lazy-FS discipline (no vault watcher in LIVE mode) and spawns
+its bridge client with `stderr:"ignore"` (launchd EBADF fix).
