@@ -4,11 +4,11 @@ Source of record for every tool the plugin's MCP server registers.  Generated
 by reading `packages/plugin/src/mcp/server.ts` and all `tools-*.ts` files.
 The fs-expressible list is locked by `tests/tool-inventory.test.mjs` (#25).
 
-**Count summary:** 17 fs-expressible + 21 always-live = **38 base** tools,
-plus up to 6 conditional integration tools = **up to 44 total**.
+**Count summary:** 17 fs-expressible + 22 always-live = **39 base** tools,
+plus up to 6 conditional integration tools = **up to 45 total**.
 
 Cross-check: the observed live set with Dataview + Templater + Metadata Menu
-loaded (but NOT Omnisearch) reports 43 tools: 38 + 5 = 43. ✓
+loaded (but NOT Omnisearch) reports 44 tools: 39 + 5 = 44. ✓
 
 ---
 
@@ -54,11 +54,12 @@ regardless of which community plugins are installed.
 | `obsidian_doctor` | Vault-mcp health, socket path, integration detection |
 | `obsidian_get_active_note` | Currently focused note + editor selection |
 
-### `tools-vault-write.ts` — `registerVaultWriteTools` (1 tool)
+### `tools-vault-write.ts` — `registerVaultWriteTools` (2 tools)
 
 | Tool name | Description |
 |---|---|
 | `obsidian_move_notes` | Batch move/rename (live-only — not in the shared 17) |
+| `obsidian_repoint_link` | Repoint every `[[link_name]]` at `target_path`, vault-wide (live-only; fixes broken links that rename-based rewrite can't touch) |
 
 ### `tools-complementary.ts` — `registerComplementaryTools` (9 tools)
 

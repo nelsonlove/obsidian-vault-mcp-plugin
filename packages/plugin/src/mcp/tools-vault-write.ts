@@ -2,13 +2,15 @@
 // obsidian_patch_note, obsidian_move_note, and obsidian_delete_note have been
 // migrated to registerFsTools + ObsidianBackend in server.ts.
 //
-// This file retains ONLY obsidian_move_notes — the live-only batch-move tool
-// that is not part of the 17 fs-expressible set — along with its helpers.
+// This file retains the live-only tools that are not part of the 17
+// fs-expressible set — obsidian_move_notes (batch move/rename) and
+// obsidian_repoint_link (repoint broken wikilinks) — along with their helpers.
 
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { type App, TFile } from "obsidian";
 import { ok, fail, okError, validateMoves } from "./helpers.js";
+import { repointLinksInText } from "./repoint.js";
 
 const RW = { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false };
 
@@ -92,6 +94,66 @@ export function registerVaultWriteTools(server: McpServer, app: App) {
       const payload = { count: moved.length, error_count: errors.length, moved, errors };
       // Partial failure is tolerated, but total failure must carry the standard MCP error flag.
       return moved.length === 0 ? okError(payload) : ok(payload);
+    }
+  );
+
+  server.registerTool(
+    "obsidian_repoint_link",
+    {
+      title: "Repoint a link",
+      description:
+        "Rewrite every wikilink whose target text matches `link_name` to point at `target_path` instead, across the whole vault. Case-insensitive on the link text; aliases ([[x|alias]]) and subpaths ([[x#heading]]) are preserved. This is the tool for fixing BROKEN links: Obsidian's rename-based backlink rewrite (obsidian_move_note/obsidian_move_notes) only touches links that already resolve to a file, so a dangling [[x]] that points at no note can only be repointed by this text-level scan. Set dry_run=true to report how many links/notes would change without writing anything.",
+      inputSchema: {
+        link_name: z
+          .string()
+          .min(1)
+          .describe("The link text inside [[ ]] to repoint, e.g. 'Foo Bar'. Case-insensitive; omit the brackets, any alias, and any #heading."),
+        target_path: z
+          .string()
+          .min(1)
+          .describe("Vault-relative path (ending in .md) of the note to point the matching links at."),
+        dry_run: z
+          .boolean()
+          .default(false)
+          .describe("If true, report linksChanged/filesChanged without modifying any files."),
+      },
+      annotations: RW,
+    },
+    async ({ link_name, target_path, dry_run }) => {
+      try {
+        if (!target_path.endsWith(".md")) return fail(new Error("target_path must end in .md"));
+        const target = app.vault.getAbstractFileByPath(target_path);
+        if (!(target instanceof TFile)) return fail(new Error(`target not found: ${target_path}`));
+
+        let filesChanged = 0;
+        let linksChanged = 0;
+        const files: string[] = [];
+
+        for (const file of app.vault.getMarkdownFiles()) {
+          // Shortest unambiguous link text for the target, relative to this source file.
+          const newTarget = app.metadataCache.fileToLinktext(target, file.path, true);
+          // Peek from cache first so unmatched files are never rewritten (no mtime churn).
+          const preview = repointLinksInText(await app.vault.cachedRead(file), link_name, newTarget);
+          if (preview.count === 0) continue;
+
+          let count = preview.count;
+          if (!dry_run) {
+            // Re-run under the write lock so the reported count reflects what was written.
+            await app.vault.process(file, (data) => {
+              const r = repointLinksInText(data, link_name, newTarget);
+              count = r.count;
+              return r.text;
+            });
+          }
+          if (count === 0) continue;
+
+          filesChanged++;
+          linksChanged += count;
+          files.push(file.path);
+        }
+
+        return ok({ link_name, target_path, dry_run, linksChanged, filesChanged, files });
+      } catch (e) { return fail(e); }
     }
   );
 }
