@@ -1,7 +1,7 @@
 {
   "id": "vault-mcp",
   "name": "Vault MCP",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "minAppVersion": "1.6.6",
   "description": "Embeds an MCP server giving Claude Code direct, canonical access to this vault via a local Unix socket.",
   "author": "Nelson Love",
