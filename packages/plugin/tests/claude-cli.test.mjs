@@ -106,3 +106,20 @@ test("claudeEnsureConnectPlugin: missing both → adds marketplace then installs
     "plugin install vault-mcp-connect@claude-code-plugins-mac --scope user",
   ]);
 });
+
+test("claudeEnsureConnectPlugin: marketplace present, plugin missing → installs only", async () => {
+  const calls = [];
+  const exec = async (bin, args) => {
+    calls.push(args.join(" "));
+    if (args.join(" ") === "plugin marketplace list") return { stdout: "❯ claude-code-plugins-mac\n" };
+    if (args.join(" ") === "plugin list") return { stdout: "Installed plugins:\n  ❯ vault-skills@claude-code-plugins-mac\n" };
+    return { stdout: "" };
+  };
+  const result = await claudeEnsureConnectPlugin("claude", { exec });
+  assert.equal(result, "installed");
+  assert.deepEqual(calls, [
+    "plugin marketplace list",
+    "plugin list",
+    "plugin install vault-mcp-connect@claude-code-plugins-mac --scope user",
+  ]);
+});

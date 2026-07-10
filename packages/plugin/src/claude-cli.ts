@@ -86,7 +86,7 @@ export function hasConnectPlugin(listOutput: string): boolean {
   return listOutput.includes(`${CONNECT_PLUGIN_NAME}@`);
 }
 
-type ExecLike = (bin: string, args: string[], opts?: { env?: NodeJS.ProcessEnv }) => Promise<{ stdout: string }>;
+type ExecLike = (bin: string, args: string[]) => Promise<{ stdout: string }>;
 
 /**
  * Idempotently ensure the marketplace is configured and vault-mcp-connect is
