@@ -5,20 +5,37 @@ export interface GuardSettings { readOnly: boolean; allowlist: string[]; }
 // Path-bearing argument keys across the tool surface.
 const PATH_KEYS = ["path", "from", "to", "target_path", "template_path", "subdir", "file_path"];
 
+// Recursively walk the args, collecting any non-empty string under a
+// PATH_KEYS-named key (and string members of a `paths` array) at ANY depth.
+// This replaces per-shape clauses (flat keys, paths[], moves[{from,to}]): a
+// future batch tool with a new nesting can't silently bypass the allowlist
+// just because nobody added its shape here (#18). Over-collection is safe —
+// worst case the guard over-blocks; silent under-collection is the failure
+// mode this eliminates. Depth-capped + cycle-guarded defensively.
 export function collectPaths(args: Record<string, unknown>): string[] {
   const out: string[] = [];
-  for (const k of PATH_KEYS) {
-    const v = args[k];
-    if (typeof v === "string" && v) out.push(v);
-  }
-  if (Array.isArray(args.paths)) for (const p of args.paths) if (typeof p === "string" && p) out.push(p);
-  if (Array.isArray(args.moves))
-    for (const m of args.moves) {
-      if (!m || typeof m !== "object") continue;
-      const { from, to } = m as Record<string, unknown>;
-      if (typeof from === "string" && from) out.push(from);
-      if (typeof to === "string" && to) out.push(to);
+  const seen = new Set<object>();
+
+  function walk(value: unknown, depth: number): void {
+    if (depth > 8 || value === null || typeof value !== "object") return;
+    if (seen.has(value as object)) return;
+    seen.add(value as object);
+    if (Array.isArray(value)) {
+      for (const item of value) walk(item, depth + 1);
+      return;
     }
+    for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+      if (PATH_KEYS.includes(k) && typeof v === "string" && v) {
+        out.push(v);
+      } else if (k === "paths" && Array.isArray(v)) {
+        for (const p of v) if (typeof p === "string" && p) out.push(p);
+      } else {
+        walk(v, depth + 1);
+      }
+    }
+  }
+
+  walk(args, 0);
   return out;
 }
 

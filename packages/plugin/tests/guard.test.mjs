@@ -129,3 +129,36 @@ test("allowlist allows in-prefix moves[]", () => {
   });
   assert.equal(result, null);
 });
+
+// ── #18: recursive collection — no bespoke clause per nesting shape ───────────
+
+test("collectPaths finds path-keyed strings at any depth (#18)", () => {
+  const result = collectPaths({
+    batch: { items: [{ path: "Deep/a.md" }, { nested: { from: "Deep/b.md", to: "Deep/c.md" } }] },
+  });
+  assert.deepEqual(result.sort(), ["Deep/a.md", "Deep/b.md", "Deep/c.md"]);
+});
+
+test("collectPaths finds paths[] arrays at any depth (#18)", () => {
+  const result = collectPaths({ query: { paths: ["x.md", "y.md"] } });
+  assert.deepEqual(result.sort(), ["x.md", "y.md"]);
+});
+
+test("collectPaths still handles moves[] without a bespoke clause (#18)", () => {
+  const result = collectPaths({ moves: [{ from: "m/a.md", to: "m/b.md" }, { from: "m/c.md", to: "m/d.md" }] });
+  assert.deepEqual(result.sort(), ["m/a.md", "m/b.md", "m/c.md", "m/d.md"]);
+});
+
+test("collectPaths ignores path-like text under non-path keys (#18)", () => {
+  const result = collectPaths({ content: "see path: Secret/x.md", query: "from A to B" });
+  assert.deepEqual(result, []);
+});
+
+test("guardCall blocks a nested out-of-allowlist path (#18 — the silent-bypass gap)", () => {
+  const blocked = guardCall({
+    isMutating: true,
+    args: { batch: [{ path: "Private/secret.md" }] },
+    settings: { readOnly: false, allowlist: ["Public"] },
+  });
+  assert.equal(blocked?.code, "out_of_allowlist");
+});
