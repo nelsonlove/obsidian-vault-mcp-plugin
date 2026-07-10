@@ -293,3 +293,43 @@ describe("wireFailover", () => {
     );
   });
 });
+
+// ── Task 4 (Phase 2b): seamless flag routes /mcp to the semantic proxy ────────
+
+describe("buildFront seamless routing (Phase 2b)", () => {
+  test("seamless dep present → /mcp routes there; live/fs untouched", async () => {
+    const fsSpy = makeHandlerSpy("fs");
+    const liveSpy = makeHandlerSpy("live");
+    const seamlessSpy = makeHandlerSpy("seamless");
+    const app = buildFront({
+      cfg,
+      token: TOKEN,
+      presence: { isLive: () => true },
+      fs: fsSpy,
+      live: liveSpy,
+      seamless: seamlessSpy,
+    });
+    const server: http.Server = await new Promise((resolve) => {
+      const s = app.listen(0, "127.0.0.1", () => resolve(s));
+    });
+    const port = (server.address() as { port: number }).port;
+    try {
+      const resp = await fetch(`http://127.0.0.1:${port}/mcp`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          authorization: `Bearer ${TOKEN}`,
+        },
+        body: JSON.stringify({ jsonrpc: "2.0", method: "ping", id: 1 }),
+      });
+      assert.equal(resp.status, 200);
+      assert.equal(seamlessSpy.callCount, 1, "seamless.handle must be routed");
+      assert.equal(liveSpy.callCount, 0, "live must not be called when seamless is set");
+      assert.equal(fsSpy.callCount, 0, "fs must not be called when seamless is set");
+    } finally {
+      await new Promise<void>((resolve, reject) =>
+        server.close((e) => (e ? reject(e) : resolve())),
+      );
+    }
+  });
+});
