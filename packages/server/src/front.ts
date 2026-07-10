@@ -34,6 +34,7 @@ import {
 import { createPresenceMonitor } from "./presence.js";
 import { createFsHandler } from "./fs-mode.js";
 import { createLiveProxy } from "./live-proxy.js";
+import { createSemanticProxy } from "./semantic-proxy.js";
 
 // ── Injectable factory ────────────────────────────────────────────────────────
 
@@ -43,10 +44,16 @@ export interface FrontDeps {
   presence: { isLive(): boolean };
   fs: { handle(req: Request, res: Response): Promise<void> };
   live: { handle(req: Request, res: Response): Promise<void> };
+  /**
+   * Phase 2b: when set (VAULT_MCP_SEAMLESS=1), ALL /mcp traffic routes to the
+   * MCP-semantic proxy, which owns the tool list per session and can flip it
+   * 44↔17 mid-session via tools/list_changed. Default off — Phase 2a routing.
+   */
+  seamless?: { handle(req: Request, res: Response): Promise<void> };
 }
 
 export function buildFront(deps: FrontDeps): express.Express {
-  const { cfg, token, presence, fs: fsHandler, live } = deps;
+  const { cfg, token, presence, fs: fsHandler, live, seamless } = deps;
 
   const authGate = createAuthGate(cfg, { token });
   // Body parsing is scoped to /mcp and applied AFTER authGate so unauthenticated
@@ -83,6 +90,10 @@ export function buildFront(deps: FrontDeps): express.Express {
   // All three HTTP verbs are wired (POST = new/stateless, GET = SSE stream,
   // DELETE = session teardown) so the full Streamable HTTP protocol is supported.
   const handler = (req: Request, res: Response): void => {
+    if (seamless) {
+      void seamless.handle(req, res);
+      return;
+    }
     void (presence.isLive() ? live.handle(req, res) : fsHandler.handle(req, res));
   };
 
@@ -239,7 +250,30 @@ if (process.argv[1] && path.resolve(process.argv[1]) === _thisFile) {
     idleMs: IDLE_MS,
   });
 
-  const app = buildFront({ cfg, token: TOKEN, presence, fs: fsHandler, live: liveProxy });
+  // Phase 2b (VAULT_MCP_SEAMLESS=1, default OFF): route /mcp through the
+  // MCP-semantic proxy so the tool surface flips 44↔17 mid-session via
+  // tools/list_changed. Off → exact Phase 2a passthrough behavior.
+  const SEAMLESS = ["1", "true", "yes", "on"].includes(
+    (process.env.VAULT_MCP_SEAMLESS ?? "").trim().toLowerCase(),
+  );
+  const semantic = SEAMLESS
+    ? createSemanticProxy({
+        bridgePath: BRIDGE,
+        presence,
+        // Lazy FS discipline (launchd EBADF fix): the index/watcher only builds
+        // when a session actually serves FS mode.
+        fsReady: () => fsHandler.ready(),
+      })
+    : undefined;
+
+  const app = buildFront({
+    cfg,
+    token: TOKEN,
+    presence,
+    fs: fsHandler,
+    live: liveProxy,
+    seamless: semantic,
+  });
 
   presence.start();
   wireFailover({ presence, live: liveProxy, fs: fsHandler });
