@@ -162,3 +162,20 @@ test("guardCall blocks a nested out-of-allowlist path (#18 — the silent-bypass
   });
   assert.equal(blocked?.code, "out_of_allowlist");
 });
+
+// ── #18 review fixes: refs[] + arrays under path keys ─────────────────────────
+
+test("collectPaths gathers refs[] (obsidian_resolve batch)", () => {
+  const result = collectPaths({ refs: ["Private/secret.md", "[[Roadmap]]"] });
+  assert.deepEqual(result.sort(), ["Private/secret.md", "[[Roadmap]]"].sort());
+});
+
+test("collectPaths gathers an array under a PATH_KEYS key ({path: [...]})", () => {
+  const result = collectPaths({ path: ["a.md", "b.md"] });
+  assert.deepEqual(result.sort(), ["a.md", "b.md"]);
+});
+
+test("collectPaths recurses into objects inside paths[]", () => {
+  const result = collectPaths({ paths: [{ path: "inner.md" }, "flat.md"] });
+  assert.deepEqual(result.sort(), ["flat.md", "inner.md"]);
+});

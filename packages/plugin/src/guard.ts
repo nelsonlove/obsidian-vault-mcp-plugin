@@ -14,10 +14,14 @@ const PATH_KEYS = ["path", "from", "to", "target_path", "template_path", "subdir
 // mode this eliminates. Depth-capped + cycle-guarded defensively.
 export function collectPaths(args: Record<string, unknown>): string[] {
   const out: string[] = [];
+  // Defensive only: MCP args arrive as parsed JSON, which can't be circular.
   const seen = new Set<object>();
+  const MAX_DEPTH = 8;
+  // Keys whose ARRAY values carry paths (refs = obsidian_resolve's batch input).
+  const ARRAY_PATH_KEYS = ["paths", "refs"];
 
   function walk(value: unknown, depth: number): void {
-    if (depth > 8 || value === null || typeof value !== "object") return;
+    if (depth > MAX_DEPTH || value === null || typeof value !== "object") return;
     if (seen.has(value as object)) return;
     seen.add(value as object);
     if (Array.isArray(value)) {
@@ -25,10 +29,16 @@ export function collectPaths(args: Record<string, unknown>): string[] {
       return;
     }
     for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
-      if (PATH_KEYS.includes(k) && typeof v === "string" && v) {
+      const isPathKey = PATH_KEYS.includes(k) || ARRAY_PATH_KEYS.includes(k);
+      if (isPathKey && typeof v === "string" && v) {
         out.push(v);
-      } else if (k === "paths" && Array.isArray(v)) {
-        for (const p of v) if (typeof p === "string" && p) out.push(p);
+      } else if (isPathKey && Array.isArray(v)) {
+        // Arrays under path keys: collect string members, recurse the rest —
+        // {path: [...]}, paths: [...], refs: [...], and paths: [{path}] all land.
+        for (const p of v) {
+          if (typeof p === "string" && p) out.push(p);
+          else walk(p, depth + 1);
+        }
       } else {
         walk(v, depth + 1);
       }
