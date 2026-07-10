@@ -58,3 +58,53 @@ export async function claudeRegister(bin: string, bridgePath: string, vaultName?
 export async function claudeRemove(bin: string): Promise<void> {
   await pexecFile(bin, ["mcp", "remove", "vault-mcp"], { env: spawnEnv() }).catch(() => { /* ignore if absent */ });
 }
+
+// ── #38: auto-provision the vault-mcp-connect Claude Code plugin ──────────────
+// The connect plugin (SessionStart health hook + /vault-mcp-status) ships from
+// the nelsonlove/claude-code-plugins marketplace at packages/plugin/cc-plugin.
+// The MCP server itself stays a DIRECT `claude mcp add` registration — bundling
+// it into a CC plugin would rename the tools to mcp__plugin_*, breaking every
+// mcp__vault-mcp__* allowlist reference (decision 2026-07-10).
+
+export const CONNECT_MARKETPLACE_NAME = "claude-code-plugins-mac";
+export const CONNECT_MARKETPLACE_SOURCE = "nelsonlove/claude-code-plugins";
+export const CONNECT_PLUGIN_NAME = "vault-mcp-connect";
+
+export function marketplaceAddArgs(): string[] {
+  return ["plugin", "marketplace", "add", CONNECT_MARKETPLACE_SOURCE];
+}
+
+export function connectInstallArgs(): string[] {
+  return ["plugin", "install", `${CONNECT_PLUGIN_NAME}@${CONNECT_MARKETPLACE_NAME}`, "--scope", "user"];
+}
+
+export function hasMarketplace(listOutput: string): boolean {
+  return listOutput.includes(CONNECT_MARKETPLACE_NAME);
+}
+
+export function hasConnectPlugin(listOutput: string): boolean {
+  return listOutput.includes(`${CONNECT_PLUGIN_NAME}@`);
+}
+
+type ExecLike = (bin: string, args: string[], opts?: { env?: NodeJS.ProcessEnv }) => Promise<{ stdout: string }>;
+
+/**
+ * Idempotently ensure the marketplace is configured and vault-mcp-connect is
+ * installed. Check-first (like claudeIsRegistered) so repeated plugin loads
+ * are cheap no-ops. Throws on CLI failure — callers decide how quietly to fail.
+ */
+export async function claudeEnsureConnectPlugin(
+  bin: string,
+  opts?: { exec?: ExecLike },
+): Promise<"already" | "installed"> {
+  const exec: ExecLike = opts?.exec ?? ((b, a) => pexecFile(b, a, { env: spawnEnv() }));
+
+  const markets = await exec(bin, ["plugin", "marketplace", "list"]);
+  if (!hasMarketplace(markets.stdout)) {
+    await exec(bin, marketplaceAddArgs());
+  }
+  const plugins = await exec(bin, ["plugin", "list"]);
+  if (hasConnectPlugin(plugins.stdout)) return "already";
+  await exec(bin, connectInstallArgs());
+  return "installed";
+}
