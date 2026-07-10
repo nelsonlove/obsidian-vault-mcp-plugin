@@ -5,7 +5,7 @@ import { buildMcpServer } from "./mcp/server.js";
 import { vaultSlug, socketPath, stateDir, bridgeDestPath } from "./paths.js";
 import { writeDiscovery, removeDiscovery, writeBridge, type Discovery } from "./discovery.js";
 import { ConnectionSetupModal, VaultMcpSettingTab } from "./connection-ui.js";
-import { findClaudeBinary, claudeIsRegistered, claudeRegister, claudeRemove } from "./claude-cli.js";
+import { findClaudeBinary, claudeIsRegistered, claudeRegister, claudeRemove, claudeEnsureConnectPlugin } from "./claude-cli.js";
 import { ExternalToolRegistry, type VaultMcpApi } from "./mcp/external-tools.js";
 
 interface VaultMcpSettings { setupAcknowledged: boolean; readOnly: boolean; allowlist: string[]; enabled: boolean; }
@@ -52,14 +52,31 @@ export default class VaultMcpPlugin extends Plugin {
       if (await claudeIsRegistered(bin)) {
         // `claude mcp add` errors on a duplicate name, so never re-add.
         if (force) new Notice("vault-mcp: already connected to Claude Code.");
+        this.ensureConnectPlugin(bin, force);
         return;
       }
       await claudeRegister(bin, bridgeDestPath(), this.app.vault.getName());
       new Notice("vault-mcp: connected to Claude Code. Restart any open Claude Code session to use it.");
+      this.ensureConnectPlugin(bin, force);
     } catch (e) {
       new Notice(`vault-mcp: auto-register failed — ${(e as Error).message}. Use the manual command in settings.`);
       this.showFallbackOnce();
     }
+  }
+
+  // #38: fire-and-forget provisioning of the vault-mcp-connect Claude Code
+  // plugin (SessionStart health hook + /vault-mcp-status) alongside the MCP
+  // registration. Idempotent + quiet: a Notice only on a forced run or when
+  // something was actually installed; failures log once, never nag.
+  private ensureConnectPlugin(bin: string, force: boolean): void {
+    void claudeEnsureConnectPlugin(bin)
+      .then((r) => {
+        if (r === "installed") new Notice("vault-mcp: installed the vault-mcp-connect Claude Code plugin.");
+        else if (force) new Notice("vault-mcp: vault-mcp-connect plugin already installed.");
+      })
+      .catch((e: unknown) => {
+        console.error("vault-mcp: connect-plugin provisioning skipped —", e instanceof Error ? e.message : e);
+      });
   }
 
   async claudeRemoveRegistration(): Promise<void> {
