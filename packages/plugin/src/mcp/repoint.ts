@@ -14,6 +14,16 @@ export function normalizeLinkName(name: string): string {
   return name.trim().toLowerCase();
 }
 
+export interface RepointOptions {
+  /** Drop an alias that merely echoes the old link name: [[Foo|Foo]] → [[New]].
+   *  Genuine display aliases ([[Foo|see this]]) are always preserved. */
+  dropEchoAlias?: boolean;
+  /** Per-link gate: return false to leave a matching link untouched. Receives the
+   *  raw target text as written (used by unresolved_only to skip links that
+   *  still resolve from their source file). */
+  allowTarget?: (rawTarget: string) => boolean;
+}
+
 /**
  * Rewrite every wikilink whose target text matches `linkName` (case-insensitive,
  * trimmed) to point at `newTarget`, preserving any alias and subpath. Returns the
@@ -23,15 +33,22 @@ export function repointLinksInText(
   content: string,
   linkName: string,
   newTarget: string,
+  opts: RepointOptions = {},
 ): { text: string; count: number } {
   const wanted = normalizeLinkName(linkName);
   let count = 0;
   const text = content.replace(
     WIKILINK_RE,
-    (_match: string, tgt: string, sub = "", alias = "") => {
-      if (normalizeLinkName(tgt) !== wanted) return _match;
+    (match: string, tgt: string, sub = "", alias = "") => {
+      if (normalizeLinkName(tgt) !== wanted) return match;
+      if (opts.allowTarget && !opts.allowTarget(tgt)) return match;
+      // alias includes its leading '|'; an "echo" alias repeats the old name.
+      let outAlias = alias;
+      if (opts.dropEchoAlias && alias && normalizeLinkName(alias.slice(1)) === wanted) {
+        outAlias = "";
+      }
       count++;
-      return `[[${newTarget}${sub}${alias}]]`;
+      return `[[${newTarget}${sub}${outAlias}]]`;
     },
   );
   return { text, count };

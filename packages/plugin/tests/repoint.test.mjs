@@ -70,3 +70,58 @@ describe("normalizeLinkName", () => {
     assert.equal(normalizeLinkName("  Foo Bar  "), "foo bar");
   });
 });
+
+describe("repointLinksInText options", () => {
+  test("default: echo alias is preserved verbatim (back-compat)", () => {
+    assert.equal(repointLinksInText("[[Foo|Foo]]", "Foo", "Bar").text, "[[Bar|Foo]]");
+  });
+
+  test("dropEchoAlias removes an alias that echoes the old name", () => {
+    const { text, count } = repointLinksInText("[[Foo|Foo]]", "Foo", "Bar", { dropEchoAlias: true });
+    assert.equal(text, "[[Bar]]");
+    assert.equal(count, 1);
+  });
+
+  test("dropEchoAlias matches the echo case-insensitively and trimmed", () => {
+    assert.equal(repointLinksInText("[[Foo|FOO]]", "Foo", "Bar", { dropEchoAlias: true }).text, "[[Bar]]");
+    assert.equal(repointLinksInText("[[Foo| foo ]]", "Foo", "Bar", { dropEchoAlias: true }).text, "[[Bar]]");
+  });
+
+  test("dropEchoAlias keeps a genuine display alias", () => {
+    assert.equal(
+      repointLinksInText("[[Foo|see the discussion]]", "Foo", "Bar", { dropEchoAlias: true }).text,
+      "[[Bar|see the discussion]]",
+    );
+  });
+
+  test("dropEchoAlias keeps subpath while dropping echo alias", () => {
+    assert.equal(repointLinksInText("[[Foo#H|Foo]]", "Foo", "Bar", { dropEchoAlias: true }).text, "[[Bar#H]]");
+  });
+
+  test("allowTarget=false leaves the link untouched and uncounted", () => {
+    const { text, count } = repointLinksInText("[[Foo]]", "Foo", "Bar", { allowTarget: () => false });
+    assert.equal(text, "[[Foo]]");
+    assert.equal(count, 0);
+  });
+
+  test("allowTarget gates per link and receives the raw target text", () => {
+    const seen = [];
+    const { text, count } = repointLinksInText(
+      "[[Foo]] and [[ Foo ]]",
+      "Foo",
+      "Bar",
+      { allowTarget: (raw) => { seen.push(raw); return raw === "Foo"; } },
+    );
+    assert.equal(text, "[[Bar]] and [[ Foo ]]");
+    assert.equal(count, 1);
+    assert.deepEqual(seen, ["Foo", " Foo "]);
+  });
+
+  test("allowTarget and dropEchoAlias compose", () => {
+    const { text } = repointLinksInText("[[Foo|Foo]] [[Foo|keep]]", "Foo", "Bar", {
+      dropEchoAlias: true,
+      allowTarget: () => true,
+    });
+    assert.equal(text, "[[Bar]] [[Bar|keep]]");
+  });
+});

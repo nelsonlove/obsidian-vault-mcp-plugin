@@ -59,7 +59,7 @@ regardless of which community plugins are installed.
 | Tool name | Description |
 |---|---|
 | `obsidian_move_notes` | Batch move/rename (live-only — not in the shared 17) |
-| `obsidian_repoint_link` | Repoint every `[[link_name]]` at `target_path`, vault-wide (live-only; fixes broken links that rename-based rewrite can't touch) |
+| `obsidian_repoint_link` | Repoint every `[[link_name]]` at `target_path`, vault-wide (live-only; fixes broken links that rename-based rewrite can't touch). Flags: `dry_run`, `unresolved_only` (skip still-resolving links), `drop_echo_alias` (drop [[x\|x]] echo aliases) |
 
 ### `tools-complementary.ts` — `registerComplementaryTools` (9 tools)
 

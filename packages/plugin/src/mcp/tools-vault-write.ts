@@ -116,10 +116,18 @@ export function registerVaultWriteTools(server: McpServer, app: App) {
           .boolean()
           .default(false)
           .describe("If true, report linksChanged/filesChanged without modifying any files."),
+        unresolved_only: z
+          .boolean()
+          .default(false)
+          .describe("Only rewrite links that do NOT currently resolve from their source file (checked per-file against metadataCache.unresolvedLinks). Guards against repointing working links that share the name."),
+        drop_echo_alias: z
+          .boolean()
+          .default(false)
+          .describe("Drop an alias that merely echoes the old link name ([[foo|foo]] becomes [[NewTarget]]), so display text follows the new target. Genuine aliases are always preserved."),
       },
       annotations: RW,
     },
-    async ({ link_name, target_path, dry_run }) => {
+    async ({ link_name, target_path, dry_run, unresolved_only, drop_echo_alias }) => {
       try {
         if (!target_path.endsWith(".md")) return fail(new Error("target_path must end in .md"));
         const target = app.vault.getAbstractFileByPath(target_path);
@@ -132,15 +140,24 @@ export function registerVaultWriteTools(server: McpServer, app: App) {
         for (const file of app.vault.getMarkdownFiles()) {
           // Shortest unambiguous link text for the target, relative to this source file.
           const newTarget = app.metadataCache.fileToLinktext(target, file.path, true);
+          // unresolved_only: gate each link on Obsidian's own per-file unresolved map,
+          // so links that still resolve from this file are left untouched.
+          let allowTarget: ((rawTarget: string) => boolean) | undefined;
+          if (unresolved_only) {
+            const unres = app.metadataCache.unresolvedLinks[file.path] ?? {};
+            const unresSet = new Set(Object.keys(unres).map((k) => k.trim().toLowerCase()));
+            allowTarget = (raw) => unresSet.has(raw.trim().toLowerCase());
+          }
+          const opts = { dropEchoAlias: drop_echo_alias, allowTarget };
           // Peek from cache first so unmatched files are never rewritten (no mtime churn).
-          const preview = repointLinksInText(await app.vault.cachedRead(file), link_name, newTarget);
+          const preview = repointLinksInText(await app.vault.cachedRead(file), link_name, newTarget, opts);
           if (preview.count === 0) continue;
 
           let count = preview.count;
           if (!dry_run) {
             // Re-run under the write lock so the reported count reflects what was written.
             await app.vault.process(file, (data) => {
-              const r = repointLinksInText(data, link_name, newTarget);
+              const r = repointLinksInText(data, link_name, newTarget, opts);
               count = r.count;
               return r.text;
             });
@@ -152,7 +169,7 @@ export function registerVaultWriteTools(server: McpServer, app: App) {
           files.push(file.path);
         }
 
-        return ok({ link_name, target_path, dry_run, linksChanged, filesChanged, files });
+        return ok({ link_name, target_path, dry_run, unresolved_only, drop_echo_alias, linksChanged, filesChanged, files });
       } catch (e) { return fail(e); }
     }
   );
