@@ -52,6 +52,10 @@ export function createPresenceMonitor(opts: {
   let consecutiveConnectFailures = 0;
   let timer: ReturnType<typeof setInterval> | null = null;
   let watcher: fs.FSWatcher | null = null;
+  // Set by stop(). A poll() already awaiting probeNow() when stop() is called
+  // must not mutate state or emit once it resolves — otherwise a slow probe
+  // (common under CI load) can fire a "down" after teardown. Reset by start().
+  let stopped = false;
 
   // ── Core probe ──────────────────────────────────────────────────────────────
 
@@ -89,6 +93,10 @@ export function createPresenceMonitor(opts: {
 
   async function poll(): Promise<void> {
     const live = await probeNow();
+    // Teardown guard: if stop() ran while this probe was in flight, drop the
+    // result. probeNow() is the only await in poll(), so a single check here
+    // fully protects the synchronous state-update/emit block below.
+    if (stopped) return;
     if (live) {
       // Success: flip to live immediately, reset the failure counter.
       consecutiveConnectFailures = 0;
@@ -130,6 +138,9 @@ export function createPresenceMonitor(opts: {
     // Idempotent: if already started, do nothing
     if (timer !== null) return;
 
+    // Clear a prior stop() so a restarted monitor can emit again.
+    stopped = false;
+
     // Immediate probe so callers don't wait a full poll interval on startup
     void poll();
 
@@ -160,6 +171,8 @@ export function createPresenceMonitor(opts: {
   }
 
   function stop(): void {
+    // Mark stopped first so any in-flight poll() drops its result on resolve.
+    stopped = true;
     if (timer !== null) {
       clearInterval(timer);
       timer = null;
