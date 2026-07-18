@@ -2,10 +2,9 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import * as net from "node:net";
 import * as fs from "node:fs";
-import * as os from "node:os";
 import * as path from "node:path";
 import { PassThrough } from "node:stream";
-import { splitLines, RelayState, BridgeRelay } from "../bridge/bridge.ts";
+import { splitLines, RelayState, BridgeRelay, envMs } from "../bridge/bridge.ts";
 
 // --- splitLines: incremental NDJSON framing ---
 
@@ -24,18 +23,33 @@ test("splitLines: blank lines dropped, CR stripped", () => {
   assert.deepEqual(r.lines, ['{"a":1}', '{"b":2}']);
 });
 
+// --- envMs: environment knob parsing ---
+
+test("envMs: unset and empty use the default (empty must not become 0)", () => {
+  assert.equal(envMs(undefined, 300), 300);
+  assert.equal(envMs("", 300), 300);
+});
+test("envMs: non-numeric uses the default (never NaN)", () => {
+  assert.equal(envMs("5m", 300), 300);
+});
+test("envMs: explicit numbers win, including 0 as an opt-out", () => {
+  assert.equal(envMs("1500", 300), 1500);
+  assert.equal(envMs("0", 300), 0);
+});
+
 // --- RelayState: handshake capture, replay, in-flight failure ---
 
 const init = JSON.stringify({ jsonrpc: "2.0", id: 0, method: "initialize", params: { protocolVersion: "2025-06-18" } });
-const initResp = JSON.stringify({ jsonrpc: "2.0", id: 0, result: { serverInfo: { name: "vault-mcp" } } });
+const initResp = JSON.stringify({ jsonrpc: "2.0", id: 0, result: { serverInfo: { name: "vault" } } });
+const initErrResp = JSON.stringify({ jsonrpc: "2.0", id: 0, error: { code: -32602, message: "unsupported protocolVersion" } });
 const initialized = JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" });
-const call = (id) => JSON.stringify({ jsonrpc: "2.0", id, method: "tools/call", params: { name: "obsidian_read" } });
+const call = (id) => JSON.stringify({ jsonrpc: "2.0", id, method: "tools/call", params: { name: "read" } });
 const resp = (id) => JSON.stringify({ jsonrpc: "2.0", id, result: {} });
 
 function handshaken() {
   const s = new RelayState();
   s.onClientMessage(init);
-  assert.equal(s.onServerMessage(initResp), true, "first initialize response is forwarded");
+  assert.equal(s.onServerMessage(initResp), "forward", "first initialize response is forwarded");
   s.onClientMessage(initialized);
   return s;
 }
@@ -45,11 +59,17 @@ test("RelayState: replay after handshake resends initialize + initialized", () =
   assert.deepEqual(s.replayMessages(), [init, initialized]);
 });
 
-test("RelayState: duplicate initialize response after replay is swallowed, once", () => {
+test("RelayState: duplicate initialize SUCCESS after replay is dropped, once", () => {
   const s = handshaken();
   s.replayMessages();
-  assert.equal(s.onServerMessage(initResp), false, "replayed handshake response must not reach the client");
-  assert.equal(s.onServerMessage(initResp), true, "only one response is swallowed per replay");
+  assert.equal(s.onServerMessage(initResp), "drop", "replayed handshake response must not reach the client");
+  assert.equal(s.onServerMessage(initResp), "forward", "only one response is swallowed per replay");
+});
+
+test("RelayState: ERROR response to a replayed initialize is surfaced, not hidden", () => {
+  const s = handshaken();
+  s.replayMessages();
+  assert.equal(s.onServerMessage(initErrResp), "replay-error");
 });
 
 test("RelayState: replay before any handshake is empty", () => {
@@ -61,7 +81,18 @@ test("RelayState: initialize still unanswered at disconnect — replayed, fresh 
   s.onClientMessage(init); // server never answered
   assert.deepEqual(s.failOutstanding("lost"), [], "unanswered initialize is replayed, not failed");
   assert.deepEqual(s.replayMessages(), [init]);
-  assert.equal(s.onServerMessage(initResp), true, "client never saw a response, so the fresh one goes through");
+  assert.equal(s.onServerMessage(initResp), "forward", "client never saw a response, so the fresh one goes through");
+});
+
+test("RelayState: id:null error response cannot poison the uncaptured initialize sentinel", () => {
+  const s = new RelayState();
+  // JSON-RPC parse-error responses carry id:null; before initialize is
+  // captured the sentinel must not treat them as the initialize response.
+  assert.equal(s.onServerMessage(JSON.stringify({ jsonrpc: "2.0", id: null, error: { code: -32700, message: "parse error" } })), "forward");
+  s.onClientMessage(init);
+  assert.deepEqual(s.failOutstanding("lost"), [], "initialize must still be exempt (initResponseSeen must not be poisoned)");
+  assert.deepEqual(s.replayMessages(), [init]);
+  assert.equal(s.onServerMessage(initResp), "forward", "fresh response must be forwarded, not swallowed");
 });
 
 test("RelayState: failOutstanding errors in-flight requests with their method, then clears", () => {
@@ -75,18 +106,57 @@ test("RelayState: failOutstanding errors in-flight requests with their method, t
   assert.deepEqual(s.failOutstanding("again"), [], "already-failed requests are not failed twice");
 });
 
+test("RelayState: batched requests are tracked and failed on disconnect", () => {
+  const s = handshaken();
+  s.onClientMessage(JSON.stringify([JSON.parse(call(8)), JSON.parse(call(9)), { jsonrpc: "2.0", method: "notifications/progress" }]));
+  const errs = s.failOutstanding("lost").map((l) => JSON.parse(l));
+  assert.deepEqual(errs.map((e) => e.id).sort(), [8, 9]);
+});
+
+test("RelayState: batched server responses resolve outstanding requests", () => {
+  const s = handshaken();
+  s.onClientMessage(JSON.stringify([JSON.parse(call(8)), JSON.parse(call(9))]));
+  assert.equal(s.onServerMessage(JSON.stringify([JSON.parse(resp(8)), JSON.parse(resp(9))])), "forward");
+  assert.deepEqual(s.failOutstanding("lost"), []);
+});
+
+test("RelayState: failRequest errors a single request and removes it from outstanding", () => {
+  const s = handshaken();
+  s.onClientMessage(call(5));
+  const err = JSON.parse(s.failRequest(call(5), "gone"));
+  assert.equal(err.id, 5);
+  assert.match(err.error.message, /gone/);
+  assert.deepEqual(s.failOutstanding("lost"), [], "failRequest must clear outstanding");
+});
+
+test("RelayState: failRequest returns null for notifications and unanswered initialize", () => {
+  const s = new RelayState();
+  s.onClientMessage(init);
+  assert.equal(s.failRequest(initialized, "gone"), null);
+  assert.equal(s.failRequest(init, "gone"), null, "initialize is replayed, never failed");
+});
+
+test("RelayState: failRequest answers a batch with a batch of errors", () => {
+  const s = handshaken();
+  const batch = JSON.stringify([JSON.parse(call(8)), { jsonrpc: "2.0", method: "notifications/progress" }]);
+  s.onClientMessage(batch);
+  const errs = JSON.parse(s.failRequest(batch, "gone"));
+  assert.ok(Array.isArray(errs));
+  assert.deepEqual(errs.map((e) => e.id), [8]);
+});
+
 test("RelayState: answered requests are no longer outstanding", () => {
   const s = handshaken();
   s.onClientMessage(call(3));
-  assert.equal(s.onServerMessage(resp(3)), true);
+  assert.equal(s.onServerMessage(resp(3)), "forward");
   assert.deepEqual(s.failOutstanding("lost"), []);
 });
 
 test("RelayState: server-initiated requests and notifications pass through untouched", () => {
   const s = handshaken();
   // server request whose id collides with the client's initialize id — has a method, so not a response
-  assert.equal(s.onServerMessage(JSON.stringify({ jsonrpc: "2.0", id: 0, method: "roots/list" })), true);
-  assert.equal(s.onServerMessage(JSON.stringify({ jsonrpc: "2.0", method: "notifications/progress" })), true);
+  assert.equal(s.onServerMessage(JSON.stringify({ jsonrpc: "2.0", id: 0, method: "roots/list" })), "forward");
+  assert.equal(s.onServerMessage(JSON.stringify({ jsonrpc: "2.0", method: "notifications/progress" })), "forward");
 });
 
 test("RelayState: client responses to server requests are not tracked as outstanding", () => {
@@ -98,16 +168,16 @@ test("RelayState: client responses to server requests are not tracked as outstan
 test("RelayState: non-JSON lines are forwarded and ignored", () => {
   const s = new RelayState();
   s.onClientMessage("garbage");
-  assert.equal(s.onServerMessage("garbage"), true);
+  assert.equal(s.onServerMessage("garbage"), "forward");
 });
 
 test("RelayState: second replay after another disconnect works", () => {
   const s = handshaken();
   s.replayMessages();
-  assert.equal(s.onServerMessage(initResp), false);
+  assert.equal(s.onServerMessage(initResp), "drop");
   assert.deepEqual(s.replayMessages(), [init, initialized]);
-  assert.equal(s.onServerMessage(initResp), false);
-  assert.equal(s.onServerMessage(initResp), true);
+  assert.equal(s.onServerMessage(initResp), "drop");
+  assert.equal(s.onServerMessage(initResp), "forward");
 });
 
 // --- BridgeRelay integration: real unix sockets, real restart ---
@@ -121,11 +191,20 @@ async function until(cond, what, timeoutMs = 5000) {
   }
 }
 
+// Short socket paths: macOS caps unix socket paths at 104 bytes.
+let sockCounter = 0;
+function tmpSock() {
+  const dir = fs.mkdtempSync("/tmp/relay-");
+  return path.join(dir, `${sockCounter++}.sock`);
+}
+
 // A fake MCP server: answers initialize and any request except ids in `ignore`.
+// `killOnAccept` destroys every new connection immediately (crash-loop mode).
 function fakeServer(sockPath, { ignore = new Set() } = {}) {
-  const state = { received: [], conns: [] };
+  const state = { received: [], conns: [], killOnAccept: false };
   try { fs.rmSync(sockPath); } catch { /* first run */ }
   state.server = net.createServer((conn) => {
+    if (state.killOnAccept) { conn.destroy(); return; }
     state.conns.push(conn);
     let buf = "";
     conn.on("data", (chunk) => {
@@ -139,8 +218,14 @@ function fakeServer(sockPath, { ignore = new Set() } = {}) {
         }
       }
     });
+    conn.on("error", () => {});
   });
   return new Promise((res) => state.server.listen(sockPath, () => res(state)));
+}
+
+async function stopServer(s) {
+  for (const c of s.conns) c.destroy();
+  await new Promise((res) => s.server.close(res));
 }
 
 function connectTo(sockPath) {
@@ -157,18 +242,48 @@ async function pollConnect(sockPath) {
   }
 }
 
-test("BridgeRelay: survives a server restart — in-flight failed, handshake replayed, queued call flushed", async () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vm-relay-"));
-  const sockPath = path.join(dir, "v.sock");
-  const s1 = await fakeServer(sockPath, { ignore: new Set([1]) }); // id 1 stays in flight
-
-  const clientIn = new PassThrough();
+// Collect parsed NDJSON lines written to a stream.
+function collect(stream) {
   const out = [];
+  let buf = "";
+  stream.on("data", (chunk) => {
+    buf += chunk.toString();
+    const lines = buf.split("\n");
+    buf = lines.pop();
+    for (const l of lines.filter(Boolean)) out.push(JSON.parse(l));
+  });
+  return out;
+}
+
+function makeRelay(sockPath, opts = {}) {
+  const clientIn = new PassThrough();
+  const clientOut = new PassThrough();
+  const out = collect(clientOut);
   const exits = [];
+  const logs = [];
+  // Stoppable reconnect: a relay left mid-reconnect at test end would
+  // otherwise poll forever and keep the test runner's event loop alive.
+  const torn = { down: false };
+  const reconnect =
+    opts.reconnect ??
+    (async () => {
+      for (;;) {
+        if (torn.down) throw new Error("test torn down");
+        try { return await connectTo(sockPath); } catch { await sleep(20); }
+      }
+    });
   const relay = new BridgeRelay(
-    { clientIn, writeToClient: (l) => out.push(JSON.parse(l)), log: () => {}, exit: (c) => exits.push(c) },
-    () => pollConnect(sockPath),
+    { clientIn, clientOut, log: (m) => logs.push(m), exit: (c) => exits.push(c) },
+    reconnect,
+    opts,
   );
+  return { relay, clientIn, out, exits, logs, stop: () => { torn.down = true; } };
+}
+
+test("BridgeRelay: survives a server restart — in-flight failed, handshake replayed, queued call flushed", async () => {
+  const sockPath = tmpSock();
+  const s1 = await fakeServer(sockPath, { ignore: new Set([1]) }); // id 1 stays in flight
+  const { relay, clientIn, out, exits, stop } = makeRelay(sockPath);
   relay.start(await connectTo(sockPath));
 
   // Handshake, then a request the server never answers.
@@ -178,8 +293,7 @@ test("BridgeRelay: survives a server restart — in-flight failed, handshake rep
   await until(() => s1.received.some((m) => m.id === 1), "in-flight request to reach server");
 
   // Obsidian "restarts": server gone, connections severed.
-  for (const c of s1.conns) c.destroy();
-  await new Promise((res) => s1.server.close(res));
+  await stopServer(s1);
 
   // The in-flight request fails fast instead of hanging.
   await until(() => out.some((m) => m.id === 1 && m.error), "in-flight failure response");
@@ -203,49 +317,125 @@ test("BridgeRelay: survives a server restart — in-flight failed, handshake rep
   await until(() => out.some((m) => m.id === 3 && m.result), "post-restart request answered");
   assert.deepEqual(exits, [], "relay must not exit across a restart");
 
-  for (const c of s2.conns) c.destroy();
-  await new Promise((res) => s2.server.close(res));
   clientIn.end();
   await until(() => exits.length === 1, "exit after client EOF");
   assert.deepEqual(exits, [0]);
+  stop();
+  await stopServer(s2);
 });
 
-test("BridgeRelay: client EOF with live socket half-closes and exits cleanly", async () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vm-relay-"));
-  const sockPath = path.join(dir, "v.sock");
+test("BridgeRelay: multi-byte characters split across socket chunks arrive intact", async () => {
+  const sockPath = tmpSock();
   const s1 = await fakeServer(sockPath);
-  const clientIn = new PassThrough();
-  const out = [];
-  const exits = [];
-  const relay = new BridgeRelay(
-    { clientIn, writeToClient: (l) => out.push(JSON.parse(l)), log: () => {}, exit: (c) => exits.push(c) },
-    () => pollConnect(sockPath),
-  );
+  const { relay, clientIn, out, stop } = makeRelay(sockPath);
   relay.start(await connectTo(sockPath));
   clientIn.write(init + "\n");
   await until(() => out.length === 1, "initialize response");
-  clientIn.end();
-  await until(() => exits.length === 1, "exit after client EOF");
-  assert.deepEqual(exits, [0]);
-  await new Promise((res) => s1.server.close(res));
+
+  // Send a response whose emoji straddles a write boundary.
+  const line = Buffer.from(JSON.stringify({ jsonrpc: "2.0", id: 42, result: { text: "café 📎 βeta" } }) + "\n");
+  const cut = line.indexOf(Buffer.from("📎")) + 2; // split INSIDE the 4-byte emoji
+  const conn = s1.conns[0];
+  conn.write(line.subarray(0, cut));
+  await sleep(30);
+  conn.write(line.subarray(cut));
+  await until(() => out.some((m) => m.id === 42), "split response");
+  assert.equal(out.find((m) => m.id === 42).result.text, "café 📎 βeta");
+  stop();
+  await stopServer(s1);
 });
 
-test("BridgeRelay: reconnect failure exits 1", async () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vm-relay-"));
-  const sockPath = path.join(dir, "v.sock");
+test("BridgeRelay: handshake sent while the vault is down is delivered exactly once", async () => {
+  const sockPath = tmpSock();
   const s1 = await fakeServer(sockPath);
-  const clientIn = new PassThrough();
-  const exits = [];
-  const logs = [];
-  const relay = new BridgeRelay(
-    { clientIn, writeToClient: () => {}, log: (m) => logs.push(m), exit: (c) => exits.push(c) },
-    () => Promise.reject(new Error("reconnect deadline exhausted")),
-  );
+  const { relay, clientIn, out, stop } = makeRelay(sockPath);
+  relay.start(await connectTo(sockPath));
+
+  // Vault dies BEFORE the client ever sends initialize.
+  await stopServer(s1);
+  clientIn.write(init + "\n");
+  await sleep(50);
+
+  const s2 = await fakeServer(sockPath);
+  await until(() => out.some((m) => m.id === 0), "initialize answered after reconnect");
+  assert.equal(s2.received.filter((m) => m.method === "initialize").length, 1, "initialize must not be sent twice (replay + queue)");
+  assert.equal(out.filter((m) => m.id === 0).length, 1, "client sees exactly one response");
+  stop();
+  await stopServer(s2);
+});
+
+test("BridgeRelay: queued requests fail after the grace budget, then recover on reconnect", async () => {
+  const sockPath = tmpSock();
+  const s1 = await fakeServer(sockPath);
+  const { relay, clientIn, out, stop } = makeRelay(sockPath, { queueGraceMs: 100 });
   relay.start(await connectTo(sockPath));
   clientIn.write(init + "\n");
-  await until(() => s1.received.length === 1, "initialize to reach server");
+  await until(() => out.length === 1, "initialize response");
+
+  await stopServer(s1);
+  clientIn.write(call(5) + "\n");
+  await until(() => out.some((m) => m.id === 5 && m.error), "queued request failed after grace", 2000);
+
+  // Past the grace budget, NEW requests fail immediately.
+  clientIn.write(call(6) + "\n");
+  await until(() => out.some((m) => m.id === 6 && m.error), "post-grace request failed fast");
+
+  // The vault returns; traffic flows again.
+  const s2 = await fakeServer(sockPath);
+  await until(() => s2.received.some((m) => m.method === "initialize"), "handshake replayed");
+  clientIn.write(call(7) + "\n");
+  await until(() => out.some((m) => m.id === 7 && m.result), "request answered after recovery");
+  stop();
+  await stopServer(s2);
+});
+
+test("BridgeRelay: crash-looping server trips the rapid-failure guard and exits 1", async () => {
+  const sockPath = tmpSock();
+  const s1 = await fakeServer(sockPath);
+  const { relay, clientIn, out, exits, logs, stop } = makeRelay(sockPath, { rapidFailMax: 3 });
+  relay.start(await connectTo(sockPath));
+  clientIn.write(init + "\n");
+  await until(() => out.length === 1, "initialize response");
+
+  // Listener stays up but murders every connection: reconnects "succeed" then die.
+  s1.killOnAccept = true;
   for (const c of s1.conns) c.destroy();
-  await new Promise((res) => s1.server.close(res));
+
+  await until(() => exits.length === 1, "exit after repeated rapid failures", 10000);
+  assert.deepEqual(exits, [1]);
+  assert.ok(logs.some((m) => /giving up/.test(m)));
+  stop();
+  await stopServer(s1);
+});
+
+test("BridgeRelay: unterminated final client line is flushed on EOF, then clean exit", async () => {
+  const sockPath = tmpSock();
+  const s1 = await fakeServer(sockPath);
+  const { relay, clientIn, out, exits, stop } = makeRelay(sockPath);
+  relay.start(await connectTo(sockPath));
+  clientIn.write(init + "\n");
+  await until(() => out.length === 1, "initialize response");
+  clientIn.write(JSON.stringify({ jsonrpc: "2.0", method: "notifications/cancelled" })); // no trailing newline
+  clientIn.end();
+  await until(() => s1.received.some((m) => m.method === "notifications/cancelled"), "unterminated line delivered");
+  await until(() => exits.length === 1, "exit after client EOF");
+  assert.deepEqual(exits, [0]);
+  stop();
+  await stopServer(s1);
+});
+
+test("BridgeRelay: reconnect failure exits 1 and answers queued requests", async () => {
+  const sockPath = tmpSock();
+  const s1 = await fakeServer(sockPath);
+  const { relay, clientIn, out, exits, logs } = makeRelay(sockPath, {
+    reconnect: () => Promise.reject(new Error("reconnect deadline exhausted")),
+  });
+  relay.start(await connectTo(sockPath));
+  clientIn.write(init + "\n");
+  await until(() => out.length === 1, "initialize response");
+  // Race-free queueing isn't possible here (the reject fires immediately), but
+  // shutdown() must still answer anything that made it into the queue.
+  await stopServer(s1);
   await until(() => exits.length === 1, "exit after failed reconnect");
   assert.deepEqual(exits, [1]);
   assert.ok(logs.some((m) => /deadline/.test(m)));
