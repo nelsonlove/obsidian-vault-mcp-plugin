@@ -9,7 +9,6 @@ import {
   RelayState,
   BridgeRelay,
   envMs,
-  flapExceeded,
 } from "../bridge/bridge.ts";
 
 // --- splitLines: incremental NDJSON framing ---
@@ -163,24 +162,14 @@ test("RelayState: failRequest answers a batch's requests AND keeps its notificat
   assert.deepEqual(kept.map((m) => m.method), ["notifications/progress"]);
 });
 
-// --- flapExceeded: sustained reconnect-flapping guard (bug #54, plausible B) ---
-
-test("flapExceeded: fewer than maxDeaths never trips", () => {
-  assert.equal(flapExceeded([0, 100], 3, 1000), false);
-});
-test("flapExceeded: maxDeaths deaths within the span trips", () => {
-  assert.equal(flapExceeded([0, 400, 800], 3, 1000), true);
-});
-test("flapExceeded: deaths just past the per-connection window still trip (the 6s>5s gap)", () => {
-  // 5 deaths 6s apart within a 25s budget: the old reset-on-any-long-lived
-  // connection missed this exact case (each connection lived >5s → counter reset).
-  assert.equal(flapExceeded([0, 6000, 12000, 18000, 24000], 5, 25000), true);
-});
-test("flapExceeded: human-paced restarts never trip", () => {
-  assert.equal(flapExceeded([0, 60000, 120000, 180000], 3, 15000), false);
-});
-test("flapExceeded: only the most recent maxDeaths matter (ancient deaths pruned)", () => {
-  assert.equal(flapExceeded([0, 100000, 100100, 100200], 3, 1000), true);
+// Review finding #1: an unclassifiable line (unparseable / JSON primitive /
+// empty batch) must be kept verbatim, not dropped — the client may await a
+// response the fresh server would supply.
+test("RelayState: failRequest keeps unparseable / primitive / empty-batch lines verbatim", () => {
+  const s = handshaken();
+  assert.deepEqual(s.failRequest("garbage", "gone"), { error: null, keep: "garbage" });
+  assert.deepEqual(s.failRequest("42", "gone"), { error: null, keep: "42" });
+  assert.deepEqual(s.failRequest("[]", "gone"), { error: null, keep: "[]" });
 });
 
 test("RelayState: answered requests are no longer outstanding", () => {
@@ -683,15 +672,15 @@ test("BridgeRelay: connected-EOF path flushes a final response before exiting", 
   await new Promise((res) => server.close(res));
 });
 
-// Review finding #2: a crash-loop with SLOW reconnects (deaths far apart) must
-// still trip the give-up guard via per-connection lifetime — the flap window
-// alone can't see it. Regression guard for the lifetime signal.
-test("BridgeRelay: slow-reconnect crash-loop trips the guard on lifetime, not just flap", async () => {
+// The give-up guard is keyed on per-connection lifetime, so a crash-loop with
+// SLOW reconnects (deaths far apart in wall-clock time) still trips it — the
+// signal is "connections keep dying young", independent of reconnect latency.
+test("BridgeRelay: slow-reconnect crash-loop trips the give-up guard on lifetime", async () => {
   const sockPath = tmpSock();
   const srv = await shortLivedServer(sockPath, 10); // each connection dies ~10ms after connect
   const reconnect = async () => { await sleep(150); return connectTo(sockPath); };
-  // flapSpan = 3 × 40 = 120ms, but deaths are ~150ms+ apart → flap never trips;
-  // lifetime ~10ms < 40ms window → the consecutive-rapid guard must.
+  // Deaths are ~150ms+ apart, but each connection lived only ~10ms < 40ms
+  // window → the consecutive-short-lived counter trips regardless of spacing.
   const { relay, exits, logs, stop } = makeRelay(sockPath, {
     rapidFailMax: 3, rapidFailWindowMs: 40, reconnect,
   });
@@ -699,6 +688,25 @@ test("BridgeRelay: slow-reconnect crash-loop trips the guard on lifetime, not ju
   await until(() => exits.length === 1, "give up on slow crash-loop", 5000);
   assert.deepEqual(exits, [1]);
   assert.ok(logs.some((m) => /unhealthy/.test(m)));
+  stop();
+  await new Promise((r) => srv.server.close(r));
+});
+
+// Review-2 finding #0: a HEALTHY vault merely restarted several times in quick
+// succession (each reconnect serving traffic) must NOT be torn down — only
+// young-death crash loops are. The death-spacing signal was removed for this.
+test("BridgeRelay: rapid healthy restarts do not trip the give-up guard", async () => {
+  const sockPath = tmpSock();
+  // Each connection lives 80ms (> the 40ms window) → healthy; 5 of them within
+  // ~1s would have tripped a death-spacing guard, but must not trip this one.
+  const srv = await shortLivedServer(sockPath, 80);
+  const reconnect = async () => { await sleep(5); return connectTo(sockPath); };
+  const { relay, exits, stop } = makeRelay(sockPath, {
+    rapidFailMax: 3, rapidFailWindowMs: 40, reconnect,
+  });
+  relay.start(await connectTo(sockPath));
+  await sleep(600); // ~6 connect/serve/die cycles
+  assert.deepEqual(exits, [], "a healthy but frequently-restarted vault must not be torn down");
   stop();
   await new Promise((r) => srv.server.close(r));
 });
@@ -747,4 +755,30 @@ test("BridgeRelay: shutdown force-exits when the client stops draining stdout", 
   await until(() => exits.length === 1, "force-exit despite a stalled stdout", 2000);
   assert.deepEqual(exits, [1]);
   clientIn.destroy();
+});
+
+// Review-2 finding #2: past the grace budget, a request must still be fast-failed
+// even when the client is streaming a notification flood — the flood must not
+// pause stdin (backpressure) and starve the fast-fail path.
+test("BridgeRelay: post-grace, a request is fast-failed behind a notification flood", async () => {
+  const sockPath = tmpSock();
+  const s1 = await fakeServer(sockPath);
+  // Small cap + short grace: without the fix, the flood would pause stdin at 3.
+  const { relay, clientIn, out, stop } = makeRelay(sockPath, {
+    queueGraceMs: 40, maxPending: 3, reconnect: () => new Promise(() => {}),
+  });
+  relay.start(await connectTo(sockPath));
+  clientIn.write(init + "\n");
+  await until(() => out.length === 1, "initialize response");
+  await stopServer(s1);
+  // Let the grace window expire (nothing queued yet).
+  await until(() => clientIn.isPaused() === false, "still reading");
+  await sleep(80); // > queueGraceMs → graceExpired
+  for (let i = 0; i < 20; i++) {
+    clientIn.write(JSON.stringify({ jsonrpc: "2.0", method: "notifications/progress", params: { i } }) + "\n");
+  }
+  clientIn.write(call(99) + "\n");
+  await until(() => out.some((m) => m.id === 99 && m.error), "request fast-failed despite the flood");
+  assert.equal(clientIn.isPaused(), false, "the notification flood must not pause the client");
+  stop();
 });

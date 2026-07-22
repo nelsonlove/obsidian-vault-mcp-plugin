@@ -396,11 +396,16 @@ export class RelayState {
         keep: null,
       };
     }
+    // Unparseable / primitive / empty-array line: nothing to classify. Keep it
+    // verbatim so it still reaches a fresh server after reconnect (which will
+    // answer it, e.g. with a parse error) instead of silently vanishing.
+    const items = parseItems(line);
+    if (items.length === 0) return { error: null, keep: line };
     // Batch: error its requests, but keep its non-request items (notifications,
     // responses) so they can still be delivered after reconnect.
     const errors: unknown[] = [];
     const kept: JsonRpcMsg[] = [];
-    for (const msg of parseItems(line)) {
+    for (const msg of items) {
       const id = msgId(msg);
       const isRequest = id !== undefined && msg.method !== undefined;
       const isExemptInitialize =
@@ -448,36 +453,15 @@ export interface RelayIO {
 export interface RelayOpts {
   /** How long queued requests wait for a reconnect before failing (ms). */
   queueGraceMs?: number;
-  /** Give up after this many consecutive short-lived (or flapping) deaths. */
+  /** Give up after this many consecutive connections that die young. */
   rapidFailMax?: number;
-  /**
-   * A connection that dies younger than this counts as a rapid failure (ms).
-   * Also seeds the flap window (rapidFailMax × this) used to catch a vault that
-   * dies reliably *just past* this threshold.
-   */
+  /** A connection younger than this at death counts as a rapid failure (ms). */
   rapidFailWindowMs?: number;
   /** Cap on lines held in the disconnected queue before backpressure kicks in
    * (0 disables the cap — unbounded, never pauses the client). */
   maxPending?: number;
   /** Ceiling on how long shutdown waits for stdout to flush before force-exiting (ms). */
   exitFlushTimeoutMs?: number;
-}
-
-// True once the most recent `maxDeaths` socket deaths all fall within `spanMs`.
-// Replaces the old "reset the counter whenever one connection outlived the
-// window" rule, which a vault dying reliably *just past* the window (≈6s vs a
-// 5s window) slipped through forever — each connection looked healthy, so the
-// counter reset every cycle and the reconnect loop spun unbounded. A rolling
-// window over the deaths themselves catches sustained flapping at any spacing
-// up to the window, while human-paced restarts (minutes apart) never trip it.
-export function flapExceeded(
-  deathTimes: number[],
-  maxDeaths: number,
-  spanMs: number
-): boolean {
-  if (deathTimes.length < maxDeaths) return false;
-  const recent = deathTimes.slice(-maxDeaths);
-  return recent[recent.length - 1] - recent[0] <= spanMs;
 }
 
 const DISCONNECT_REASON =
@@ -493,13 +477,11 @@ export class BridgeRelay {
   private graceTimer: NodeJS.Timeout | null = null;
   private graceExpired = false;
   private connectedAt = 0;
-  private consecutiveRapid = 0;
-  private deathTimes: number[] = [];
+  private rapidFails = 0;
   private clientPausedForQueue = false;
   private readonly queueGraceMs: number;
   private readonly rapidFailMax: number;
   private readonly rapidFailWindowMs: number;
-  private readonly flapSpanMs: number;
   private readonly maxPending: number;
   private readonly exitFlushTimeoutMs: number;
 
@@ -511,9 +493,18 @@ export class BridgeRelay {
     this.queueGraceMs = opts.queueGraceMs ?? 30000;
     this.rapidFailMax = opts.rapidFailMax ?? 5;
     this.rapidFailWindowMs = opts.rapidFailWindowMs ?? 5000;
-    this.flapSpanMs = this.rapidFailMax * this.rapidFailWindowMs;
     this.maxPending = opts.maxPending ?? 10000;
     this.exitFlushTimeoutMs = opts.exitFlushTimeoutMs ?? 5000;
+  }
+
+  // Fail the requests in `line`, writing their JSON-RPC error responses, and
+  // return the part to re-queue for delivery after reconnect (notifications,
+  // responses, unclassifiable lines), or null. Single source of the
+  // disconnect-fail contract so its three callers can't drift (bug #54.3).
+  private failAndWrite(line: string): string | null {
+    const { error, keep } = this.state.failRequest(line, DISCONNECT_REASON);
+    if (error) this.io.clientOut.write(`${error}\n`);
+    return keep;
   }
 
   // Queue a line for later delivery, applying backpressure: once the
@@ -571,12 +562,12 @@ export class BridgeRelay {
       if (sock) {
         if (!sock.write(`${line}\n`)) overflowed = true;
       } else if (this.graceExpired) {
-        // The vault has been gone past the grace budget: answer new requests
-        // immediately instead of letting the client hang on the queue, but
-        // still keep notifications so they're delivered once the vault returns.
-        const { error, keep } = this.state.failRequest(line, DISCONNECT_REASON);
-        if (error) this.io.clientOut.write(`${error}\n`);
-        if (keep) this.enqueue(keep);
+        // Past the grace budget: answer new requests immediately rather than
+        // letting the client hang on the queue. The non-request remainder is
+        // dropped, NOT re-queued — during a long outage a client streaming
+        // notifications could otherwise flood `pending`, trip backpressure, and
+        // pause stdin, which would starve this very fast-fail path.
+        this.failAndWrite(line);
       } else {
         this.enqueue(line);
       }
@@ -633,28 +624,25 @@ export class BridgeRelay {
     // the queue-pause flag is cleared with it so enqueue can re-arm cleanly.
     this.clientPausedForQueue = false;
     this.io.clientIn.resume();
-    // A vault that keeps dying is unhealthy — reconnect deadlines never bind
-    // (each connect "succeeds"), so bound the churn instead of looping the
-    // replay forever. Two independent signals trip it:
-    //   • consecutive short-lived connections (die younger than the window) —
-    //     a crash-on-accept loop, at ANY reconnect latency; and
-    //   • deaths flapping within the window (flapExceeded) — a vault that dies
-    //     reliably just past the per-connection threshold.
-    const now = Date.now();
-    if (now - this.connectedAt < this.rapidFailWindowMs) this.consecutiveRapid += 1;
-    else this.consecutiveRapid = 0;
-    this.deathTimes.push(now);
-    if (this.deathTimes.length > this.rapidFailMax) this.deathTimes.shift();
+    // Connections that keep dying young mean the vault plugin is unhealthy —
+    // reconnect deadlines never bind (each connect "succeeds"), so bound the
+    // cycle count instead of looping the replay forever. Keyed on per-connection
+    // LIFETIME, not death spacing: a healthy vault that merely gets restarted a
+    // few times in quick succession (a plugin reload/auto-update cycle) served
+    // traffic each time and must not be torn down — only crash-on-accept loops
+    // (young deaths) are, at any reconnect latency.
+    if (Date.now() - this.connectedAt < this.rapidFailWindowMs) {
+      this.rapidFails += 1;
+    } else {
+      this.rapidFails = 0;
+    }
     for (const line of this.state.failOutstanding(DISCONNECT_REASON)) {
       this.io.clientOut.write(`${line}\n`);
     }
-    if (
-      this.consecutiveRapid >= this.rapidFailMax ||
-      flapExceeded(this.deathTimes, this.rapidFailMax, this.flapSpanMs)
-    ) {
+    if (this.rapidFails >= this.rapidFailMax) {
       this.io.log?.(
-        `giving up: the vault socket kept dying (${this.rapidFailMax}× rapidly) ` +
-          `— the vault plugin looks unhealthy`
+        `giving up: ${this.rapidFailMax} consecutive connections died within ` +
+          `${this.rapidFailWindowMs}ms — the vault plugin looks unhealthy`
       );
       this.shutdown(1);
       return;
@@ -666,8 +654,7 @@ export class BridgeRelay {
         this.graceExpired = true;
         const kept: string[] = [];
         for (const line of this.pending) {
-          const { error, keep } = this.state.failRequest(line, DISCONNECT_REASON);
-          if (error) this.io.clientOut.write(`${error}\n`);
+          const keep = this.failAndWrite(line);
           if (keep) kept.push(keep);
         }
         this.pending = kept;
@@ -718,10 +705,8 @@ export class BridgeRelay {
       this.graceTimer = null;
     }
     // Answer whatever is still queued so the client isn't left hanging.
-    for (const line of this.pending.splice(0)) {
-      const { error } = this.state.failRequest(line, DISCONNECT_REASON);
-      if (error) this.io.clientOut.write(`${error}\n`);
-    }
+    // (We're terminating, so the kept remainder can't be delivered — drop it.)
+    for (const line of this.pending.splice(0)) this.failAndWrite(line);
     this.flushThenExit(code);
   }
 
