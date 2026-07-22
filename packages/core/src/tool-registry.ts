@@ -284,6 +284,7 @@ export const FS_TOOLS: ToolDef[] = [
       "Read or modify one top-level frontmatter field of a note. Supports inline-scalar (`key: value`), inline-array (`key: [a, b]`), and block-array (`key:\\n  - a`) shapes. " +
       "Refuses to edit fields using block-scalar (|/>) or inline-object shapes to avoid silent corruption. " +
       "`set` creates the frontmatter block if absent. Other keys' formatting (indentation, quoting) is preserved — only the target key's lines get rewritten. " +
+      "Wikilink values must be passed as quoted JSON strings (e.g. `value: \"[[Note]]\"` or `value: [\"[[Note]]\"]`) — a bare `[[...]]` is invalid JSON (it parses as a nested array) and is rejected before reaching this tool. Quoted wikilink values are serialized correctly to YAML. " +
       "Note: changes are applied live. Call `obsidian_force_reindex` before follow-up index queries if you need a synchronous index refresh.",
     inputSchema: {
       path: z.string().min(1).describe("Vault-relative path of the note, ending in .md."),
@@ -294,7 +295,7 @@ export const FS_TOOLS: ToolDef[] = [
         .regex(PROP_RE, "Key must be a YAML identifier (letters/digits/underscore/hyphen, starting with letter or underscore)")
         .describe("Frontmatter field name."),
       op: z.enum(["get", "set", "delete"]).describe("Operation."),
-      value: FmValue.optional().describe("Required for `set`. Ignored otherwise. Arrays serialize as block lists."),
+      value: FmValue.optional().describe("Required for `set`. Ignored otherwise. Arrays serialize as block lists. Wikilink values must be quoted strings, e.g. `\"[[Note]]\"`."),
     },
     annotations: RW,
     capability: "fs-expressible",
