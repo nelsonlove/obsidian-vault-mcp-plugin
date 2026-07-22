@@ -104,6 +104,39 @@ test("one message split across two writes is reassembled", async () => {
   try { fs.unlinkSync(sock); } catch {}
 });
 
+test("CRLF line endings and blank lines are handled (shared NDJSON framer)", async () => {
+  // Locks in the framing edge behavior now that the transport and the bridge
+  // share one splitLines: a `\r` before the newline is stripped so JSON.parse
+  // succeeds, and blank lines between messages are ignored — no divergence.
+  const sock = tmpSock("crlf");
+  try { fs.unlinkSync(sock); } catch {}
+  const received = [];
+  const errors = [];
+  const listener = new UnixSocketListener(sock, (t) => {
+    t.onmessage = (m) => received.push(m);
+    t.onerror = (e) => errors.push(e);
+    t.start();
+  });
+  await listener.listen();
+
+  const client = net.createConnection(sock);
+  await new Promise((r) => client.once("connect", r));
+  client.write(
+    JSON.stringify({ jsonrpc: "2.0", id: 1, method: "crlf" }) + "\r\n" +
+    "\n" +        // empty line: dropped
+    "   \t\n" +   // whitespace-only line: dropped, must NOT reach JSON.parse
+    JSON.stringify({ jsonrpc: "2.0", id: 2, method: "after" }) + "\r\n",
+  );
+
+  await new Promise((r) => setTimeout(r, 100));
+  assert.deepEqual(received.map((m) => m.method), ["crlf", "after"]);
+  assert.deepEqual(errors, [], "blank/whitespace-only frames must not surface parse errors");
+
+  client.destroy();
+  await listener.close();
+  try { fs.unlinkSync(sock); } catch {}
+});
+
 test("serves multiple concurrent clients independently (no eviction)", async () => {
   const sock = tmpSock("multiclient");
   try { fs.unlinkSync(sock); } catch {}
