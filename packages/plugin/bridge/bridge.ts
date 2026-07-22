@@ -523,9 +523,15 @@ export class BridgeRelay {
     }
   }
 
-  // Undo an enqueue-induced pause once the queue has drained enough.
+  // Undo an enqueue-induced pause. Unconditional (not gated on queue size): the
+  // only callers are the reconnect flush (queue already drained) and grace
+  // expiry, where we MUST resume even with a still-large retained queue —
+  // otherwise a notification flood that paused stdin before grace would keep it
+  // paused and starve the post-grace fast-fail path. Past grace we never
+  // re-pause (the fast-fail branch retains bounded and never enqueues), so
+  // resuming here can't reintroduce unbounded growth.
   private resumeClient(): void {
-    if (this.clientPausedForQueue && this.pending.length < this.maxPending) {
+    if (this.clientPausedForQueue) {
       this.clientPausedForQueue = false;
       this.io.clientIn.resume();
     }
@@ -563,11 +569,14 @@ export class BridgeRelay {
         if (!sock.write(`${line}\n`)) overflowed = true;
       } else if (this.graceExpired) {
         // Past the grace budget: answer new requests immediately rather than
-        // letting the client hang on the queue. The non-request remainder is
-        // dropped, NOT re-queued — during a long outage a client streaming
-        // notifications could otherwise flood `pending`, trip backpressure, and
-        // pause stdin, which would starve this very fast-fail path.
-        this.failAndWrite(line);
+        // letting the client hang on the queue. Retain the non-request
+        // remainder for delivery after reconnect, but bounded and WITHOUT
+        // backpressure — dropping once the queue is full instead of pausing
+        // stdin, which would starve this very fast-fail path.
+        const keep = this.failAndWrite(line);
+        if (keep && (this.maxPending <= 0 || this.pending.length < this.maxPending)) {
+          this.pending.push(keep);
+        }
       } else {
         this.enqueue(line);
       }

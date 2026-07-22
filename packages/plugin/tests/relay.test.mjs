@@ -782,3 +782,29 @@ test("BridgeRelay: post-grace, a request is fast-failed behind a notification fl
   assert.equal(clientIn.isPaused(), false, "the notification flood must not pause the client");
   stop();
 });
+
+// Review-3 finding #1: a flood that pauses stdin BEFORE grace expiry must not
+// leave it paused afterwards — otherwise the client can't send the request that
+// grace-expiry exists to fast-fail, and it hangs for the whole reconnect window.
+test("BridgeRelay: stdin paused by a pre-grace flood is resumed at grace expiry", async () => {
+  const sockPath = tmpSock();
+  const s1 = await fakeServer(sockPath);
+  const { relay, clientIn, out, stop } = makeRelay(sockPath, {
+    queueGraceMs: 150, maxPending: 3, reconnect: () => new Promise(() => {}),
+  });
+  relay.start(await connectTo(sockPath));
+  clientIn.write(init + "\n");
+  await until(() => out.length === 1, "initialize response");
+  await stopServer(s1);
+  // Flood DURING the grace window → pending fills to the cap → stdin pauses.
+  for (let i = 0; i < 12; i++) {
+    clientIn.write(JSON.stringify({ jsonrpc: "2.0", method: "notifications/progress", params: { i } }) + "\n");
+  }
+  await until(() => clientIn.isPaused(), "stdin paused by the pre-grace flood");
+  // Grace expires: the retained notification queue is still full, but stdin must
+  // resume anyway so the client's next request can be fast-failed.
+  await until(() => clientIn.isPaused() === false, "stdin resumed at grace expiry", 2000);
+  clientIn.write(call(99) + "\n");
+  await until(() => out.some((m) => m.id === 99 && m.error), "post-grace request fast-failed, not hung");
+  stop();
+});
