@@ -179,14 +179,17 @@ function sleep(ms: number): Promise<void> {
 // Resolves to a connected socket, or null if the socket file exists but isn't
 // accepting yet (stale/just-restarted) — a retryable condition. Rejects only on
 // unexpected errors worth surfacing immediately.
+//
+// Every connect-phase error is treated as retryable, including EACCES/EPERM:
+// during a plugin reload the socket is briefly recreated and a permission errno
+// can be transient (wrong owner/mode for a moment, AV/sandbox interposition).
+// Fast-failing on it would kill the whole session on a blip that clears in
+// milliseconds; the wait deadline already bounds a genuinely permanent error.
 function tryConnect(chosen: Discovery): Promise<net.Socket | null> {
   return new Promise((resolve) => {
     const sock = net.createConnection(chosen.socket_path);
     sock.once("connect", () => resolve(sock));
     sock.once("error", () => {
-      // Any connect-phase error is retryable: ENOENT/ECONNREFUSED while the
-      // vault is down, ECONNRESET/EAGAIN mid-restart. The wait deadline
-      // bounds persistence, so a permanent error still surfaces there.
       sock.destroy();
       resolve(null);
     });
@@ -361,41 +364,58 @@ export class RelayState {
   }
 
   /**
-   * If `line` is a failable request, error it immediately (removing it from
-   * outstanding) and return the error response line; null means "not a
-   * request, keep queueing it" (notifications, responses, an unanswered
-   * initialize).
+   * Decide how to handle a queued client line when the vault won't answer it:
+   *   `error` — a JSON-RPC error line to send now (the line's failable
+   *             requests, already removed from outstanding); null if none.
+   *   `keep`  — the part of the line to re-queue for delivery once the vault
+   *             returns (notifications, responses, an unanswered initialize);
+   *             null if nothing survives.
+   * A single request yields `{error, keep: null}`; a single notification yields
+   * `{error: null, keep: line}`. A batch is split: its requests are errored and
+   * its notifications are preserved in a `keep` batch — so a `notifications/
+   * cancelled` riding alongside a failed request is never lost.
    */
-  failRequest(line: string, reason: string): string | null {
+  failRequest(line: string, reason: string): { error: string | null; keep: string | null } {
     const single = parseMsg(line);
     if (single) {
       const id = msgId(single);
-      if (id === undefined || single.method === undefined) return null;
+      if (id === undefined || single.method === undefined) return { error: null, keep: line };
       if (
         this.initializeId !== undefined &&
         id === this.initializeId &&
         !this.initResponseSeen
       )
-        return null;
+        return { error: null, keep: line };
       this.outstanding.delete(id);
-      return JSON.stringify({
-        jsonrpc: "2.0",
-        id,
-        error: { code: -32000, message: `${reason} (request: ${single.method})` },
-      });
+      return {
+        error: JSON.stringify({
+          jsonrpc: "2.0",
+          id,
+          error: { code: -32000, message: `${reason} (request: ${single.method})` },
+        }),
+        keep: null,
+      };
     }
-    // Batch: answer its requests as a batch of errors. (Notifications inside a
-    // partially-failed batch are dropped with it — an accepted edge case.)
+    // Unparseable / primitive / empty-array line: nothing to classify. Keep it
+    // verbatim so it still reaches a fresh server after reconnect (which will
+    // answer it, e.g. with a parse error) instead of silently vanishing.
+    const items = parseItems(line);
+    if (items.length === 0) return { error: null, keep: line };
+    // Batch: error its requests, but keep its non-request items (notifications,
+    // responses) so they can still be delivered after reconnect.
     const errors: unknown[] = [];
-    for (const msg of parseItems(line)) {
+    const kept: JsonRpcMsg[] = [];
+    for (const msg of items) {
       const id = msgId(msg);
-      if (id === undefined || msg.method === undefined) continue;
-      if (
+      const isRequest = id !== undefined && msg.method !== undefined;
+      const isExemptInitialize =
         this.initializeId !== undefined &&
         id === this.initializeId &&
-        !this.initResponseSeen
-      )
+        !this.initResponseSeen;
+      if (!isRequest || isExemptInitialize) {
+        kept.push(msg);
         continue;
+      }
       this.outstanding.delete(id);
       errors.push({
         jsonrpc: "2.0",
@@ -403,7 +423,10 @@ export class RelayState {
         error: { code: -32000, message: `${reason} (request: ${msg.method})` },
       });
     }
-    return errors.length > 0 ? JSON.stringify(errors) : null;
+    return {
+      error: errors.length > 0 ? JSON.stringify(errors) : null,
+      keep: kept.length > 0 ? JSON.stringify(kept) : null,
+    };
   }
 
   /** Handshake lines to send to a fresh server before resuming traffic. */
@@ -434,6 +457,11 @@ export interface RelayOpts {
   rapidFailMax?: number;
   /** A connection younger than this at death counts as a rapid failure (ms). */
   rapidFailWindowMs?: number;
+  /** Cap on lines held in the disconnected queue before backpressure kicks in
+   * (0 disables the cap — unbounded, never pauses the client). */
+  maxPending?: number;
+  /** Ceiling on how long shutdown waits for stdout to flush before force-exiting (ms). */
+  exitFlushTimeoutMs?: number;
 }
 
 const DISCONNECT_REASON =
@@ -450,9 +478,12 @@ export class BridgeRelay {
   private graceExpired = false;
   private connectedAt = 0;
   private rapidFails = 0;
+  private clientPausedForQueue = false;
   private readonly queueGraceMs: number;
   private readonly rapidFailMax: number;
   private readonly rapidFailWindowMs: number;
+  private readonly maxPending: number;
+  private readonly exitFlushTimeoutMs: number;
 
   constructor(
     private io: RelayIO,
@@ -462,6 +493,48 @@ export class BridgeRelay {
     this.queueGraceMs = opts.queueGraceMs ?? 30000;
     this.rapidFailMax = opts.rapidFailMax ?? 5;
     this.rapidFailWindowMs = opts.rapidFailWindowMs ?? 5000;
+    this.maxPending = opts.maxPending ?? 10000;
+    this.exitFlushTimeoutMs = opts.exitFlushTimeoutMs ?? 5000;
+  }
+
+  // Fail the requests in `line`, writing their JSON-RPC error responses, and
+  // return the part to re-queue for delivery after reconnect (notifications,
+  // responses, unclassifiable lines), or null. Single source of the
+  // disconnect-fail contract so its three callers can't drift (bug #54.3).
+  private failAndWrite(line: string): string | null {
+    const { error, keep } = this.state.failRequest(line, DISCONNECT_REASON);
+    if (error) this.io.clientOut.write(`${error}\n`);
+    return keep;
+  }
+
+  // Queue a line for later delivery, applying backpressure: once the
+  // disconnected queue fills, pause the client so an outage can't grow memory
+  // without bound (the connected path pauses on sock overflow the same way).
+  // maxPending <= 0 disables the cap (unbounded) rather than pausing forever.
+  private enqueue(line: string): void {
+    this.pending.push(line);
+    if (
+      this.maxPending > 0 &&
+      this.pending.length >= this.maxPending &&
+      !this.clientPausedForQueue
+    ) {
+      this.clientPausedForQueue = true;
+      this.io.clientIn.pause();
+    }
+  }
+
+  // Undo an enqueue-induced pause. Unconditional (not gated on queue size): the
+  // only callers are the reconnect flush (queue already drained) and grace
+  // expiry, where we MUST resume even with a still-large retained queue —
+  // otherwise a notification flood that paused stdin before grace would keep it
+  // paused and starve the post-grace fast-fail path. Past grace we never
+  // re-pause (the fast-fail branch retains bounded and never enqueues), so
+  // resuming here can't reintroduce unbounded growth.
+  private resumeClient(): void {
+    if (this.clientPausedForQueue) {
+      this.clientPausedForQueue = false;
+      this.io.clientIn.resume();
+    }
   }
 
   start(first: net.Socket): void {
@@ -476,8 +549,11 @@ export class BridgeRelay {
       // The old pipe forwarded every byte before half-closing; flush an
       // unterminated final message rather than dropping it.
       if (this.inBuf.length > 0) this.onClientData("\n");
+      // Socket up: half-close and let onSocketClose exit. Socket down (mid-
+      // reconnect): shutdown() answers anything still queued before exiting —
+      // a bare exit(0) here would silently drop requests the client awaits.
       if (this.sock) this.sock.end();
-      else this.io.exit(0);
+      else this.shutdown(0);
     });
     this.attach(first);
   }
@@ -492,13 +568,17 @@ export class BridgeRelay {
       if (sock) {
         if (!sock.write(`${line}\n`)) overflowed = true;
       } else if (this.graceExpired) {
-        // The vault has been gone past the grace budget: answer new requests
-        // immediately instead of letting the client hang on the queue.
-        const err = this.state.failRequest(line, DISCONNECT_REASON);
-        if (err) this.io.clientOut.write(`${err}\n`);
-        else this.pending.push(line);
+        // Past the grace budget: answer new requests immediately rather than
+        // letting the client hang on the queue. Retain the non-request
+        // remainder for delivery after reconnect, but bounded and WITHOUT
+        // backpressure — dropping once the queue is full instead of pausing
+        // stdin, which would starve this very fast-fail path.
+        const keep = this.failAndWrite(line);
+        if (keep && (this.maxPending <= 0 || this.pending.length < this.maxPending)) {
+          this.pending.push(keep);
+        }
       } else {
-        this.pending.push(line);
+        this.enqueue(line);
       }
     }
     // pipe()-equivalent backpressure: pause the source until the sink drains.
@@ -544,14 +624,22 @@ export class BridgeRelay {
   private onSocketClose(): void {
     this.sock = null;
     if (this.clientEnded) {
-      this.io.exit(0);
+      // The vault may have just written its final response (still buffered in
+      // the async stdout pipe); flush before exiting so it isn't truncated.
+      this.flushThenExit(0);
       return;
     }
-    // A stream paused for backpressure would otherwise stay paused forever.
+    // A stream paused for backpressure would otherwise stay paused forever;
+    // the queue-pause flag is cleared with it so enqueue can re-arm cleanly.
+    this.clientPausedForQueue = false;
     this.io.clientIn.resume();
     // Connections that keep dying young mean the vault plugin is unhealthy —
     // reconnect deadlines never bind (each connect "succeeds"), so bound the
-    // cycle count instead of looping the replay forever.
+    // cycle count instead of looping the replay forever. Keyed on per-connection
+    // LIFETIME, not death spacing: a healthy vault that merely gets restarted a
+    // few times in quick succession (a plugin reload/auto-update cycle) served
+    // traffic each time and must not be torn down — only crash-on-accept loops
+    // (young deaths) are, at any reconnect latency.
     if (Date.now() - this.connectedAt < this.rapidFailWindowMs) {
       this.rapidFails += 1;
     } else {
@@ -575,16 +663,23 @@ export class BridgeRelay {
         this.graceExpired = true;
         const kept: string[] = [];
         for (const line of this.pending) {
-          const err = this.state.failRequest(line, DISCONNECT_REASON);
-          if (err) this.io.clientOut.write(`${err}\n`);
-          else kept.push(line);
+          const keep = this.failAndWrite(line);
+          if (keep) kept.push(keep);
         }
         this.pending = kept;
+        this.resumeClient();
       }, this.queueGraceMs);
     }
     this.io.log?.("socket closed; waiting for Obsidian to come back");
     this.reconnect().then(
       (sock) => {
+        // The client EOF'd while we were reconnecting: the session is already
+        // shut down. Don't attach/replay against a dead client — just drop the
+        // freshly-won socket (and leave no orphaned live connection behind).
+        if (this.clientEnded) {
+          sock.destroy();
+          return;
+        }
         if (this.graceTimer) {
           clearTimeout(this.graceTimer);
           this.graceTimer = null;
@@ -601,9 +696,12 @@ export class BridgeRelay {
           if (replayed.includes(line)) continue;
           sock.write(`${line}\n`);
         }
+        this.resumeClient();
         this.io.log?.("reconnected");
       },
       (e: unknown) => {
+        // Already shut down by the EOF path — nothing left to fail or exit.
+        if (this.clientEnded) return;
         this.io.log?.((e as Error).message);
         this.shutdown(1);
       }
@@ -616,11 +714,30 @@ export class BridgeRelay {
       this.graceTimer = null;
     }
     // Answer whatever is still queued so the client isn't left hanging.
-    for (const line of this.pending.splice(0)) {
-      const err = this.state.failRequest(line, DISCONNECT_REASON);
-      if (err) this.io.clientOut.write(`${err}\n`);
-    }
-    this.io.exit(code);
+    // (We're terminating, so the kept remainder can't be delivered — drop it.)
+    for (const line of this.pending.splice(0)) this.failAndWrite(line);
+    this.flushThenExit(code);
+  }
+
+  // Exit only after clientOut has flushed. clientOut is process.stdout, an
+  // async pipe when Claude Code spawns us; process.exit() truncates its
+  // unflushed writes, so synthesized error/response lines written this tick
+  // would never reach the client and it would hang instead of seeing the error.
+  // Write callbacks fire in order, so deferring the exit to a final flush's
+  // callback guarantees every prior write landed first. A timeout backstop
+  // guarantees termination even if the client stopped draining stdout (then the
+  // callback would never fire and the bridge would linger as an orphan). Unref'd
+  // so the backstop never keeps the process alive on the happy path.
+  private flushThenExit(code: number): void {
+    let done = false;
+    const exit = (): void => {
+      if (done) return;
+      done = true;
+      this.io.exit(code);
+    };
+    this.io.clientOut.write("", exit);
+    const t = setTimeout(exit, this.exitFlushTimeoutMs);
+    (t as { unref?: () => void }).unref?.();
   }
 }
 
@@ -629,6 +746,9 @@ export class BridgeRelay {
 const RECONNECT_MS = envMs(process.env.VAULT_MCP_RECONNECT_MS, 300000);
 // How long queued requests wait for that reconnect before failing fast.
 const QUEUE_GRACE_MS = envMs(process.env.VAULT_MCP_QUEUE_GRACE_MS, 30000);
+// Cap on lines held in the disconnected queue before the client is paused, so
+// a long outage streaming notifications can't grow memory without bound.
+const MAX_PENDING = envMs(process.env.VAULT_MCP_MAX_PENDING, 10000);
 
 // The startup wait loop, reused for reconnects: poll discoveries until the
 // pinned (or sole) vault accepts a connection, else throw the same actionable
@@ -676,7 +796,7 @@ if (process.argv[1] && process.argv[1].endsWith("bridge.mjs")) {
         exit: (code) => process.exit(code),
       },
       async () => (await waitForVault(pinned, Date.now() + RECONNECT_MS)).sock,
-      { queueGraceMs: QUEUE_GRACE_MS }
+      { queueGraceMs: QUEUE_GRACE_MS, maxPending: MAX_PENDING }
     );
     relay.start(sock);
   })().catch((e) => {
