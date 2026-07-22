@@ -176,40 +176,22 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-// A connect-phase errno worth *retrying*: the vault is down or mid-restart and
-// the socket may start accepting shortly. A permanent error (the socket is
-// owned by another user, or its perms deny us) can never resolve by waiting —
-// polling it for the whole deadline just hangs the session for minutes and then
-// reports a generic "plugin disabled" message that masks the real cause. Treat
-// those as fatal so they surface immediately. Unknown/undefined codes stay
-// retryable (fail-open: the deadline still bounds them).
-const FATAL_CONNECT_ERRNOS = new Set(["EACCES", "EPERM"]);
-
-export function retryableConnectError(code: string | undefined): boolean {
-  return code === undefined || !FATAL_CONNECT_ERRNOS.has(code);
-}
-
 // Resolves to a connected socket, or null if the socket file exists but isn't
-// accepting yet (stale/just-restarted) — a retryable condition. Rejects on a
-// permanent connect error (EACCES/EPERM) so it fast-fails with the real errno
-// instead of polling a socket we can never reach.
+// accepting yet (stale/just-restarted) — a retryable condition. Rejects only on
+// unexpected errors worth surfacing immediately.
+//
+// Every connect-phase error is treated as retryable, including EACCES/EPERM:
+// during a plugin reload the socket is briefly recreated and a permission errno
+// can be transient (wrong owner/mode for a moment, AV/sandbox interposition).
+// Fast-failing on it would kill the whole session on a blip that clears in
+// milliseconds; the wait deadline already bounds a genuinely permanent error.
 function tryConnect(chosen: Discovery): Promise<net.Socket | null> {
-  return new Promise((resolve, reject) => {
+  return new Promise((resolve) => {
     const sock = net.createConnection(chosen.socket_path);
     sock.once("connect", () => resolve(sock));
-    sock.once("error", (err: NodeJS.ErrnoException) => {
+    sock.once("error", () => {
       sock.destroy();
-      if (retryableConnectError(err.code)) {
-        resolve(null);
-        return;
-      }
-      reject(
-        new Error(
-          `vault-mcp: cannot connect to vault '${chosen.vault_name}' — ` +
-            `${err.code} on ${chosen.socket_path} (a permission error that won't ` +
-            `clear by waiting; check the socket's owner and mode)`
-        )
-      );
+      resolve(null);
     });
   });
 }
@@ -466,12 +448,19 @@ export interface RelayIO {
 export interface RelayOpts {
   /** How long queued requests wait for a reconnect before failing (ms). */
   queueGraceMs?: number;
-  /** Give up once this many socket deaths flap within the flap window. */
+  /** Give up after this many consecutive short-lived (or flapping) deaths. */
   rapidFailMax?: number;
-  /** Per-death spacing knob; the flap window is rapidFailMax × this (ms). */
+  /**
+   * A connection that dies younger than this counts as a rapid failure (ms).
+   * Also seeds the flap window (rapidFailMax × this) used to catch a vault that
+   * dies reliably *just past* this threshold.
+   */
   rapidFailWindowMs?: number;
-  /** Cap on lines held in the disconnected queue before backpressure kicks in. */
+  /** Cap on lines held in the disconnected queue before backpressure kicks in
+   * (0 disables the cap — unbounded, never pauses the client). */
   maxPending?: number;
+  /** Ceiling on how long shutdown waits for stdout to flush before force-exiting (ms). */
+  exitFlushTimeoutMs?: number;
 }
 
 // True once the most recent `maxDeaths` socket deaths all fall within `spanMs`.
@@ -503,12 +492,16 @@ export class BridgeRelay {
   private pending: string[] = [];
   private graceTimer: NodeJS.Timeout | null = null;
   private graceExpired = false;
+  private connectedAt = 0;
+  private consecutiveRapid = 0;
   private deathTimes: number[] = [];
   private clientPausedForQueue = false;
   private readonly queueGraceMs: number;
   private readonly rapidFailMax: number;
+  private readonly rapidFailWindowMs: number;
   private readonly flapSpanMs: number;
   private readonly maxPending: number;
+  private readonly exitFlushTimeoutMs: number;
 
   constructor(
     private io: RelayIO,
@@ -517,16 +510,23 @@ export class BridgeRelay {
   ) {
     this.queueGraceMs = opts.queueGraceMs ?? 30000;
     this.rapidFailMax = opts.rapidFailMax ?? 5;
-    this.flapSpanMs = this.rapidFailMax * (opts.rapidFailWindowMs ?? 5000);
+    this.rapidFailWindowMs = opts.rapidFailWindowMs ?? 5000;
+    this.flapSpanMs = this.rapidFailMax * this.rapidFailWindowMs;
     this.maxPending = opts.maxPending ?? 10000;
+    this.exitFlushTimeoutMs = opts.exitFlushTimeoutMs ?? 5000;
   }
 
   // Queue a line for later delivery, applying backpressure: once the
   // disconnected queue fills, pause the client so an outage can't grow memory
   // without bound (the connected path pauses on sock overflow the same way).
+  // maxPending <= 0 disables the cap (unbounded) rather than pausing forever.
   private enqueue(line: string): void {
     this.pending.push(line);
-    if (this.pending.length >= this.maxPending && !this.clientPausedForQueue) {
+    if (
+      this.maxPending > 0 &&
+      this.pending.length >= this.maxPending &&
+      !this.clientPausedForQueue
+    ) {
       this.clientPausedForQueue = true;
       this.io.clientIn.pause();
     }
@@ -591,6 +591,7 @@ export class BridgeRelay {
   private attach(sock: net.Socket): void {
     this.sock = sock;
     this.sockBuf = "";
+    this.connectedAt = Date.now();
     sock.setEncoding("utf8");
     sock.on("data", (chunk: string) => this.onServerData(chunk, sock));
     sock.on("error", () => {
@@ -623,7 +624,9 @@ export class BridgeRelay {
   private onSocketClose(): void {
     this.sock = null;
     if (this.clientEnded) {
-      this.io.exit(0);
+      // The vault may have just written its final response (still buffered in
+      // the async stdout pipe); flush before exiting so it isn't truncated.
+      this.flushThenExit(0);
       return;
     }
     // A stream paused for backpressure would otherwise stay paused forever;
@@ -631,17 +634,27 @@ export class BridgeRelay {
     this.clientPausedForQueue = false;
     this.io.clientIn.resume();
     // A vault that keeps dying is unhealthy — reconnect deadlines never bind
-    // (each connect "succeeds"), so bound the churn: give up once deaths flap
-    // within the window instead of looping the replay forever.
-    this.deathTimes.push(Date.now());
+    // (each connect "succeeds"), so bound the churn instead of looping the
+    // replay forever. Two independent signals trip it:
+    //   • consecutive short-lived connections (die younger than the window) —
+    //     a crash-on-accept loop, at ANY reconnect latency; and
+    //   • deaths flapping within the window (flapExceeded) — a vault that dies
+    //     reliably just past the per-connection threshold.
+    const now = Date.now();
+    if (now - this.connectedAt < this.rapidFailWindowMs) this.consecutiveRapid += 1;
+    else this.consecutiveRapid = 0;
+    this.deathTimes.push(now);
     if (this.deathTimes.length > this.rapidFailMax) this.deathTimes.shift();
     for (const line of this.state.failOutstanding(DISCONNECT_REASON)) {
       this.io.clientOut.write(`${line}\n`);
     }
-    if (flapExceeded(this.deathTimes, this.rapidFailMax, this.flapSpanMs)) {
+    if (
+      this.consecutiveRapid >= this.rapidFailMax ||
+      flapExceeded(this.deathTimes, this.rapidFailMax, this.flapSpanMs)
+    ) {
       this.io.log?.(
-        `giving up: the vault socket died ${this.rapidFailMax} times within ` +
-          `${this.flapSpanMs}ms — the vault plugin looks unhealthy`
+        `giving up: the vault socket kept dying (${this.rapidFailMax}× rapidly) ` +
+          `— the vault plugin looks unhealthy`
       );
       this.shutdown(1);
       return;
@@ -709,14 +722,28 @@ export class BridgeRelay {
       const { error } = this.state.failRequest(line, DISCONNECT_REASON);
       if (error) this.io.clientOut.write(`${error}\n`);
     }
-    // Don't exit until clientOut has flushed. clientOut is process.stdout, an
-    // async pipe when Claude Code spawns us; process.exit() truncates its
-    // unflushed writes, so the synthesized error responses above (and any
-    // written earlier this tick by failOutstanding) would never reach the
-    // client and it would hang instead of seeing "connection lost". Write
-    // callbacks fire in order, so deferring the exit to a final flush's
-    // callback guarantees every prior write landed first.
-    this.io.clientOut.write("", () => this.io.exit(code));
+    this.flushThenExit(code);
+  }
+
+  // Exit only after clientOut has flushed. clientOut is process.stdout, an
+  // async pipe when Claude Code spawns us; process.exit() truncates its
+  // unflushed writes, so synthesized error/response lines written this tick
+  // would never reach the client and it would hang instead of seeing the error.
+  // Write callbacks fire in order, so deferring the exit to a final flush's
+  // callback guarantees every prior write landed first. A timeout backstop
+  // guarantees termination even if the client stopped draining stdout (then the
+  // callback would never fire and the bridge would linger as an orphan). Unref'd
+  // so the backstop never keeps the process alive on the happy path.
+  private flushThenExit(code: number): void {
+    let done = false;
+    const exit = (): void => {
+      if (done) return;
+      done = true;
+      this.io.exit(code);
+    };
+    this.io.clientOut.write("", exit);
+    const t = setTimeout(exit, this.exitFlushTimeoutMs);
+    (t as { unref?: () => void }).unref?.();
   }
 }
 

@@ -9,7 +9,6 @@ import {
   RelayState,
   BridgeRelay,
   envMs,
-  retryableConnectError,
   flapExceeded,
 } from "../bridge/bridge.ts";
 
@@ -162,18 +161,6 @@ test("RelayState: failRequest answers a batch's requests AND keeps its notificat
   const kept = JSON.parse(keep);
   assert.ok(Array.isArray(kept));
   assert.deepEqual(kept.map((m) => m.method), ["notifications/progress"]);
-});
-
-// --- retryableConnectError: fast-fail on permanent connect errors (bug #54, plausible A) ---
-
-test("retryableConnectError: transient socket errors keep polling", () => {
-  for (const c of ["ENOENT", "ECONNREFUSED", "ECONNRESET", "EAGAIN", undefined]) {
-    assert.equal(retryableConnectError(c), true, `${c} should be retryable`);
-  }
-});
-test("retryableConnectError: permission errors are fatal (don't poll for minutes)", () => {
-  assert.equal(retryableConnectError("EACCES"), false);
-  assert.equal(retryableConnectError("EPERM"), false);
 });
 
 // --- flapExceeded: sustained reconnect-flapping guard (bug #54, plausible B) ---
@@ -623,4 +610,141 @@ test("BridgeRelay: a reconnect resolving after client EOF does not replay agains
   assert.equal(exits.length, 1, "no second exit");
   stop();
   await stopServer(s2);
+});
+
+// A server whose accepted connections cleanly die `lifeMs` after connect.
+// Unlike killOnAccept (which races the client's 'connect' event), this always
+// completes the handshake first, so the client sees a short-LIVED connection.
+function shortLivedServer(sockPath, lifeMs) {
+  const state = { conns: [] };
+  try { fs.rmSync(sockPath); } catch { /* first run */ }
+  state.server = net.createServer((conn) => {
+    state.conns.push(conn);
+    conn.on("error", () => {});
+    const t = setTimeout(() => conn.destroy(), lifeMs);
+    t.unref?.();
+  });
+  return new Promise((res) => state.server.listen(sockPath, () => res(state)));
+}
+
+// Review finding #1: the client-EOF exit path (onSocketClose, clientEnded) must
+// also flush before exit — a final vault response written just before close was
+// truncated by the old synchronous io.exit(0), same hazard as shutdown(). The
+// server uses allowHalfOpen so it can still send after the client half-closes.
+test("BridgeRelay: connected-EOF path flushes a final response before exiting", async () => {
+  const sockPath = tmpSock();
+  const events = [];
+  const clientIn = new PassThrough();
+  // Model the async stdout pipe with a timers-phase flush (setTimeout), NOT
+  // setImmediate: the socket 'close' that drives this exit runs in the
+  // close-callback phase, which is AFTER the check phase — a setImmediate flush
+  // would always beat a synchronous exit and mask the bug. A timers-phase flush
+  // lands next iteration, so a synchronous io.exit(0) races ahead of it (the
+  // truncation this fix prevents).
+  const clientOut = {
+    write(chunk, cb) {
+      setTimeout(() => { events.push("flush"); if (cb) cb(); }, 0);
+      return true;
+    },
+  };
+  let serverConn;
+  const server = net.createServer({ allowHalfOpen: true }, (conn) => {
+    serverConn = conn;
+    conn.on("error", () => {});
+    conn.on("data", (chunk) => {
+      for (const line of splitLines("", chunk.toString()).lines) {
+        const msg = JSON.parse(line);
+        if (msg.method === "initialize") {
+          conn.write(JSON.stringify({ jsonrpc: "2.0", id: msg.id, result: {} }) + "\n");
+        }
+      }
+    });
+  });
+  await new Promise((res) => server.listen(sockPath, res));
+  const relay = new BridgeRelay(
+    { clientIn, clientOut, log: () => {}, exit: () => events.push("exit") },
+    () => new Promise(() => {}), // reconnect never resolves; the EOF path returns first
+    {},
+  );
+  relay.start(await connectTo(sockPath));
+  clientIn.write(init + "\n");
+  await until(() => events.length >= 1, "initialize response forwarded");
+  clientIn.end();          // clientEnded = true; bridge half-closes its write side
+  await until(() => serverConn, "server accepted the connection");
+  await sleep(20);
+  events.length = 0;       // ignore the handshake flush
+  serverConn.write(JSON.stringify({ jsonrpc: "2.0", id: 77, result: { ok: true } }) + "\n");
+  serverConn.end();        // flush the response, then FIN → onSocketClose(clientEnded)
+  await until(() => events.includes("exit"), "exit after connected EOF", 3000);
+  assert.equal(events.at(-1), "exit", "exit must be the final event");
+  assert.ok(events.length >= 2 && events.slice(0, -1).every((e) => e === "flush"),
+    "the final response must flush before exit");
+  clientIn.destroy();
+  await new Promise((res) => server.close(res));
+});
+
+// Review finding #2: a crash-loop with SLOW reconnects (deaths far apart) must
+// still trip the give-up guard via per-connection lifetime — the flap window
+// alone can't see it. Regression guard for the lifetime signal.
+test("BridgeRelay: slow-reconnect crash-loop trips the guard on lifetime, not just flap", async () => {
+  const sockPath = tmpSock();
+  const srv = await shortLivedServer(sockPath, 10); // each connection dies ~10ms after connect
+  const reconnect = async () => { await sleep(150); return connectTo(sockPath); };
+  // flapSpan = 3 × 40 = 120ms, but deaths are ~150ms+ apart → flap never trips;
+  // lifetime ~10ms < 40ms window → the consecutive-rapid guard must.
+  const { relay, exits, logs, stop } = makeRelay(sockPath, {
+    rapidFailMax: 3, rapidFailWindowMs: 40, reconnect,
+  });
+  relay.start(await connectTo(sockPath));
+  await until(() => exits.length === 1, "give up on slow crash-loop", 5000);
+  assert.deepEqual(exits, [1]);
+  assert.ok(logs.some((m) => /unhealthy/.test(m)));
+  stop();
+  await new Promise((r) => srv.server.close(r));
+});
+
+// Review finding #3: maxPending=0 is an opt-out (unbounded), not "pause on the
+// first line and never resume".
+test("BridgeRelay: maxPending=0 disables the cap and never pauses the client", async () => {
+  const sockPath = tmpSock();
+  const s1 = await fakeServer(sockPath);
+  let resolveReconnect;
+  const reconnect = () => new Promise((res) => { resolveReconnect = res; });
+  const { relay, clientIn, stop } = makeRelay(sockPath, { queueGraceMs: 60000, maxPending: 0, reconnect });
+  relay.start(await connectTo(sockPath));
+  clientIn.write(init + "\n");
+  await sleep(30);
+  await stopServer(s1);
+  await until(() => resolveReconnect !== undefined, "reconnect started");
+  for (let i = 0; i < 20; i++) {
+    clientIn.write(JSON.stringify({ jsonrpc: "2.0", method: "notifications/progress", params: { i } }) + "\n");
+  }
+  await sleep(50);
+  assert.equal(clientIn.isPaused(), false, "maxPending=0 must never pause the client");
+  stop();
+});
+
+// Review finding #5: shutdown must still terminate even if the client stops
+// draining stdout (the flush callback would never fire) — a timeout backstop.
+test("BridgeRelay: shutdown force-exits when the client stops draining stdout", async () => {
+  const sockPath = tmpSock();
+  const s1 = await fakeServer(sockPath);
+  const clientIn = new PassThrough();
+  const exits = [];
+  // A stalled pipe: writes never invoke their callback.
+  const clientOut = { write() { return false; } };
+  let rejectReconnect;
+  const relay = new BridgeRelay(
+    { clientIn, clientOut, log: () => {}, exit: (c) => exits.push(c) },
+    () => new Promise((_res, rej) => { rejectReconnect = rej; }),
+    { queueGraceMs: 60000, exitFlushTimeoutMs: 40 },
+  );
+  relay.start(await connectTo(sockPath));
+  clientIn.write(init + "\n");
+  await stopServer(s1);
+  await until(() => rejectReconnect !== undefined, "reconnect started");
+  rejectReconnect(new Error("reconnect deadline exhausted"));
+  await until(() => exits.length === 1, "force-exit despite a stalled stdout", 2000);
+  assert.deepEqual(exits, [1]);
+  clientIn.destroy();
 });
