@@ -208,19 +208,11 @@ function tryConnect(chosen: Discovery): Promise<net.Socket | null> {
 // to the fresh per-connection McpServer (swallowing the duplicate response the
 // client already got), and flush the queue.
 
-export function splitLines(
-  buffer: string,
-  chunk: string
-): { lines: string[]; rest: string } {
-  const parts = (buffer + chunk).split("\n");
-  const rest = parts.pop() ?? "";
-  return {
-    lines: parts
-      .map((l) => (l.endsWith("\r") ? l.slice(0, -1) : l))
-      .filter((l) => l.length > 0),
-    rest,
-  };
-}
+// NDJSON framing lives in one shared module so the bridge and the server
+// transport can't diverge (see src/ndjson.ts). Imported for local use and
+// re-exported for callers/tests that import it from here.
+import { splitLines } from "../src/ndjson.js";
+export { splitLines };
 
 type JsonRpcId = string | number;
 
@@ -231,37 +223,46 @@ interface JsonRpcMsg {
   error?: unknown;
 }
 
-function parseMsg(raw: string): JsonRpcMsg | null {
+// Parse a client/server line ONCE into both views the relay needs, instead of
+// JSON.parse-ing it twice (a single-message check + a batch-items list):
+//   single — the message iff the line is a lone JSON-RPC object, else null.
+//   items  — the flat message list: a batch's object elements, or [single], or
+//            [] for a primitive / unparseable / empty-array line.
+function parseFrame(raw: string): { single: JsonRpcMsg | null; items: JsonRpcMsg[] } {
+  let v: unknown;
   try {
-    const v: unknown = JSON.parse(raw);
-    return v !== null && typeof v === "object" && !Array.isArray(v)
-      ? (v as JsonRpcMsg)
-      : null;
+    v = JSON.parse(raw);
   } catch {
-    return null;
+    return { single: null, items: [] };
   }
-}
-
-// A JSON-RPC batch is an array of messages; normalize both shapes to a list
-// so request tracking covers batched requests too.
-function parseItems(raw: string): JsonRpcMsg[] {
-  try {
-    const v: unknown = JSON.parse(raw);
-    if (Array.isArray(v)) {
-      return v.filter(
-        (x): x is JsonRpcMsg => x !== null && typeof x === "object"
-      );
-    }
-    return v !== null && typeof v === "object" ? [v as JsonRpcMsg] : [];
-  } catch {
-    return [];
+  if (Array.isArray(v)) {
+    return {
+      single: null,
+      items: v.filter((x): x is JsonRpcMsg => x !== null && typeof x === "object"),
+    };
   }
+  if (v !== null && typeof v === "object") {
+    const msg = v as JsonRpcMsg;
+    return { single: msg, items: [msg] };
+  }
+  return { single: null, items: [] };
 }
 
 // `id: null` is JSON-RPC's "unidentifiable request" sentinel (error responses
 // to unparseable input) — treat it as absent so it can never match a real id.
 function msgId(msg: JsonRpcMsg): JsonRpcId | undefined {
   return msg.id === null ? undefined : msg.id;
+}
+
+// The single disconnect-error JSON-RPC response shape, so the `-32000` literal
+// and its message format live in exactly one place across failOutstanding /
+// failRequest (single + batch).
+function disconnectError(
+  id: JsonRpcId,
+  method: string,
+  reason: string
+): { jsonrpc: "2.0"; id: JsonRpcId; error: { code: number; message: string } } {
+  return { jsonrpc: "2.0", id, error: { code: -32000, message: `${reason} (request: ${method})` } };
 }
 
 // What to do with a server→client line:
@@ -280,8 +281,19 @@ export class RelayState {
   private awaitingReplayResponse = false;
   private outstanding = new Map<JsonRpcId, string>();
 
+  // An unanswered `initialize` is exempt from failure — the reconnect replay
+  // resends it and the fresh response is forwarded instead. Copied nowhere:
+  // the one predicate the fail* paths share.
+  private isExemptInitialize(id: JsonRpcId | undefined): boolean {
+    return (
+      this.initializeId !== undefined &&
+      id === this.initializeId &&
+      !this.initResponseSeen
+    );
+  }
+
   onClientMessage(raw: string): void {
-    const single = parseMsg(raw);
+    const { single, items } = parseFrame(raw);
     if (single) {
       const id = msgId(single);
       if (
@@ -301,7 +313,7 @@ export class RelayState {
     // Track every request — batched or not — so failOutstanding can answer
     // them. Only requests (id + method) await a response; client→server
     // responses to server-initiated requests carry an id but no method.
-    for (const msg of parseItems(raw)) {
+    for (const msg of items) {
       const id = msgId(msg);
       if (id !== undefined && msg.method !== undefined) {
         this.outstanding.set(id, msg.method);
@@ -310,11 +322,11 @@ export class RelayState {
   }
 
   onServerMessage(raw: string): ServerVerdict {
-    const msg = parseMsg(raw);
-    if (!msg) {
+    const { single, items } = parseFrame(raw);
+    if (!single) {
       // Batch responses resolve their items; the replayed initialize is never
       // sent in a batch, so batches always pass through.
-      for (const item of parseItems(raw)) {
+      for (const item of items) {
         const id = msgId(item);
         if (id !== undefined && item.method === undefined) {
           this.outstanding.delete(id);
@@ -322,15 +334,15 @@ export class RelayState {
       }
       return "forward";
     }
-    const id = msgId(msg);
+    const id = msgId(single);
     // Server-initiated requests/notifications have a method; only responses
     // (id, no method) resolve outstanding client requests.
-    if (id === undefined || msg.method !== undefined) return "forward";
+    if (id === undefined || single.method !== undefined) return "forward";
     this.outstanding.delete(id);
     if (this.initializeId !== undefined && id === this.initializeId) {
       if (this.awaitingReplayResponse) {
         this.awaitingReplayResponse = false;
-        return msg.error !== undefined ? "replay-error" : "drop";
+        return single.error !== undefined ? "replay-error" : "drop";
       }
       this.initResponseSeen = true;
     }
@@ -345,19 +357,8 @@ export class RelayState {
   failOutstanding(reason: string): string[] {
     const out: string[] = [];
     for (const [id, method] of [...this.outstanding]) {
-      if (
-        this.initializeId !== undefined &&
-        id === this.initializeId &&
-        !this.initResponseSeen
-      )
-        continue;
-      out.push(
-        JSON.stringify({
-          jsonrpc: "2.0",
-          id,
-          error: { code: -32000, message: `${reason} (request: ${method})` },
-        })
-      );
+      if (this.isExemptInitialize(id)) continue;
+      out.push(JSON.stringify(disconnectError(id, method, reason)));
       this.outstanding.delete(id);
     }
     return out;
@@ -376,30 +377,17 @@ export class RelayState {
    * cancelled` riding alongside a failed request is never lost.
    */
   failRequest(line: string, reason: string): { error: string | null; keep: string | null } {
-    const single = parseMsg(line);
+    const { single, items } = parseFrame(line);
     if (single) {
       const id = msgId(single);
       if (id === undefined || single.method === undefined) return { error: null, keep: line };
-      if (
-        this.initializeId !== undefined &&
-        id === this.initializeId &&
-        !this.initResponseSeen
-      )
-        return { error: null, keep: line };
+      if (this.isExemptInitialize(id)) return { error: null, keep: line };
       this.outstanding.delete(id);
-      return {
-        error: JSON.stringify({
-          jsonrpc: "2.0",
-          id,
-          error: { code: -32000, message: `${reason} (request: ${single.method})` },
-        }),
-        keep: null,
-      };
+      return { error: JSON.stringify(disconnectError(id, single.method, reason)), keep: null };
     }
     // Unparseable / primitive / empty-array line: nothing to classify. Keep it
     // verbatim so it still reaches a fresh server after reconnect (which will
     // answer it, e.g. with a parse error) instead of silently vanishing.
-    const items = parseItems(line);
     if (items.length === 0) return { error: null, keep: line };
     // Batch: error its requests, but keep its non-request items (notifications,
     // responses) so they can still be delivered after reconnect.
@@ -407,21 +395,12 @@ export class RelayState {
     const kept: JsonRpcMsg[] = [];
     for (const msg of items) {
       const id = msgId(msg);
-      const isRequest = id !== undefined && msg.method !== undefined;
-      const isExemptInitialize =
-        this.initializeId !== undefined &&
-        id === this.initializeId &&
-        !this.initResponseSeen;
-      if (!isRequest || isExemptInitialize) {
+      if (id === undefined || msg.method === undefined || this.isExemptInitialize(id)) {
         kept.push(msg);
         continue;
       }
       this.outstanding.delete(id);
-      errors.push({
-        jsonrpc: "2.0",
-        id,
-        error: { code: -32000, message: `${reason} (request: ${msg.method})` },
-      });
+      errors.push(disconnectError(id, msg.method, reason));
     }
     return {
       error: errors.length > 0 ? JSON.stringify(errors) : null,

@@ -5,6 +5,7 @@ import type {
   Transport,
   TransportSendOptions,
 } from "@modelcontextprotocol/sdk/shared/transport.js";
+import { splitLines } from "./ndjson.js";
 
 /**
  * SDK Transport for a SINGLE Unix-socket connection. Frames newline-delimited
@@ -26,12 +27,9 @@ export class UnixSocketConnTransport implements Transport {
     this.started = true;
     this.conn.setEncoding("utf8");
     this.conn.on("data", (chunk: string) => {
-      this.buf += chunk;
-      let nl: number;
-      while ((nl = this.buf.indexOf("\n")) >= 0) {
-        const line = this.buf.slice(0, nl).trim();
-        this.buf = this.buf.slice(nl + 1);
-        if (!line) continue;
+      const { lines, rest } = splitLines(this.buf, chunk);
+      this.buf = rest;
+      for (const line of lines) {
         try {
           this.onmessage?.(JSON.parse(line) as JSONRPCMessage);
         } catch (e) {
