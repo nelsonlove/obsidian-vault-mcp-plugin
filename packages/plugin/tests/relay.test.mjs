@@ -27,6 +27,10 @@ test("splitLines: blank lines dropped, CR stripped", () => {
   const r = splitLines("", '{"a":1}\r\n\n{"b":2}\n');
   assert.deepEqual(r.lines, ['{"a":1}', '{"b":2}']);
 });
+test("splitLines: whitespace-only lines dropped (never reach JSON.parse)", () => {
+  const r = splitLines("", '{"a":1}\n   \n\t\n{"b":2}\n');
+  assert.deepEqual(r.lines, ['{"a":1}', '{"b":2}']);
+});
 
 // --- envMs: environment knob parsing ---
 

@@ -6,8 +6,12 @@
 // pulling anything else across the bridge/plugin boundary.
 //
 // Accumulates `buffer` (the carried partial line from the previous chunk) with
-// `chunk`, returns the complete lines (trailing `\r` stripped, blank lines
-// dropped) and the new partial `rest` to carry forward.
+// `chunk`, returns the complete lines (trailing `\r` stripped, blank AND
+// whitespace-only lines dropped) and the new partial `rest` to carry forward.
+// Dropping whitespace-only lines — not just empty ones — matches the server
+// transport's original per-line skip so a padded/blank frame never reaches
+// JSON.parse and surfaces a spurious error. (JSON with incidental surrounding
+// whitespace still parses, since the line content itself is left untrimmed.)
 export function splitLines(
   buffer: string,
   chunk: string
@@ -17,7 +21,7 @@ export function splitLines(
   return {
     lines: parts
       .map((l) => (l.endsWith("\r") ? l.slice(0, -1) : l))
-      .filter((l) => l.length > 0),
+      .filter((l) => l.trim().length > 0),
     rest,
   };
 }
