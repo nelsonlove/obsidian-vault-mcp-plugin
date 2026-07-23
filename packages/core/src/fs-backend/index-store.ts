@@ -38,7 +38,7 @@ export type { FrontmatterValue, ResolveResult, OutlinkEntry };
 export interface IndexedNote {
   path: string;                                  // vault-relative, e.g. "Folder/Note.md"
   basename: string;                              // filename without .md, e.g. "Note"
-  jdId?: string;                                 // shortcut accessor; same as frontmatter["jd-id"]
+  jdId?: string;                                 // canonical JD id, derived from filename + note-kind (see deriveJdIdFromPath)
   aliases: string[];                             // shortcut accessor; same as frontmatter.aliases when array-typed
   outlinks: string[];                            // raw [[wikilink targets]] extracted from body
   frontmatter: Record<string, FrontmatterValue>; // best-effort parsed top-level YAML scalars/arrays
@@ -221,13 +221,67 @@ export function parseAllFrontmatter(text: string): Record<string, FrontmatterVal
 }
 
 /** Backward-compatible shortcut for buildIndex's needs. */
-function parseFrontmatter(text: string): { jdId?: string; aliases: string[]; full: Record<string, FrontmatterValue> } {
+function parseFrontmatter(text: string): { aliases: string[]; full: Record<string, FrontmatterValue> } {
   const full = parseAllFrontmatter(text);
-  const jdRaw = full["jd-id"];
-  const jdId = typeof jdRaw === "string" ? jdRaw : typeof jdRaw === "number" ? String(jdRaw) : undefined;
   const aliasesRaw = full["aliases"];
   const aliases = Array.isArray(aliasesRaw) ? aliasesRaw : typeof aliasesRaw === "string" && aliasesRaw ? [aliasesRaw] : [];
-  return { jdId, aliases, full };
+  return { aliases, full };
+}
+
+// Areas/categories that use 5-digit ("expanded") ids, mirroring the
+// jd-numbering plugin's DEFAULT_CONFIG (obsidian-jd-numbering src/jd.ts). A
+// 5-digit filename prefix is only a JD id inside one of these; elsewhere it is
+// just a title that happens to start with digits — "10000 Hours.md" is NOT id
+// 10000. Keep in sync with jd-numbering; the two are the vault's canonical model.
+const EXPANDED_AREAS = new Set(["90-99"]);
+const EXPANDED_CATEGORIES = new Set(["27"]);
+
+/**
+ * Derive a note's canonical JD id from its filename + folder, replicating the
+ * vault's JD model (jd-numbering `parseJdId` / `canonicalFolderNoteId` and the
+ * `jd-id vs filename.base` classifier). The filename is canonical; the id is a
+ * pure function of (path, note-kind):
+ *   - area folder note      ("00-09 System/00-09 System.md")          → "00-09"
+ *   - category folder note  ("…/00 System management/00 System …")    → "00.00"
+ *   - id note               ("04.18 obsidian-execute-code.md")        → "04.18"
+ *   - project note          ("92208 Concept note.md")                 → "92208"
+ * A 5-digit prefix only counts inside an expanded area/category (see above);
+ * "NN.NN"-prefixed names always count (matching the vault model). Returns
+ * undefined for notes with no JD prefix. This replaced the former frontmatter
+ * `jd-id` lookup when that property was retired in favour of filename-canonical.
+ */
+export function deriveJdIdFromPath(relPath: string, basename: string): string | undefined {
+  const slash = relPath.lastIndexOf("/");
+  const folder = slash >= 0 ? relPath.slice(0, slash) : "";
+  // Area folder note: the note is its own folder note and the folder is an area.
+  if (folder === basename) {
+    const m = basename.match(/^(\d0-\d9) /);
+    if (m) return m[1];
+  }
+  // Category folder note: folder ends with "/<basename>" and the folder path is
+  // "<area>/<NN …>" (area then category, exactly two levels). An id-level folder
+  // note (three-segment folder, "NN.NN …" basename) fails this and falls to the
+  // id branch below, correctly yielding "NN.NN" rather than "NN.00".
+  if (folder.endsWith("/" + basename) && /^\d0-\d9 [^/]+\/\d{2} [^/]+$/.test(folder)) {
+    return basename.slice(0, 2) + ".00";
+  }
+  // Id note: "NN.NN <title>".
+  const idMatch = basename.match(/^(\d{2}\.\d{2}) /);
+  if (idMatch) return idMatch[1];
+  // Project / expanded-item note: "NNNNN <title>". Matches jd-numbering's model
+  // (parseJdId): a flat 5-digit id is valid in an expanded area OR category; a
+  // fractal "NNNNN.NN" id is valid only in an expanded AREA.
+  const projMatch = basename.match(/^(\d{5})(\.\d{2})? /);
+  if (projMatch) {
+    const cat = projMatch[1].slice(0, 2);
+    const area = `${cat[0]}0-${cat[0]}9`;
+    if (projMatch[2]) {
+      if (EXPANDED_AREAS.has(area)) return projMatch[1] + projMatch[2];
+    } else if (EXPANDED_AREAS.has(area) || EXPANDED_CATEGORIES.has(cat)) {
+      return projMatch[1];
+    }
+  }
+  return undefined;
 }
 
 /**
@@ -395,7 +449,8 @@ async function _parseNoteFromDisk(root: string, absPath: string): Promise<Indexe
   const relPath = path.relative(root, absPath).split(path.sep).join("/");
   const basename = path.basename(relPath, ".md");
   const text = await fs.readFile(absPath, "utf8");
-  const { jdId, aliases, full } = parseFrontmatter(text);
+  const { aliases, full } = parseFrontmatter(text);
+  const jdId = deriveJdIdFromPath(relPath, basename);
   const outlinks = parseOutlinks(text);
   return { path: relPath, basename, jdId, aliases, outlinks, frontmatter: full };
 }
@@ -416,7 +471,8 @@ async function _doBuildIndex(root: string, setState: (s: IndexState) => void): P
       } catch {
         continue;
       }
-      const { jdId, aliases, full } = parseFrontmatter(text);
+      const { aliases, full } = parseFrontmatter(text);
+      const jdId = deriveJdIdFromPath(relPath, basename);
       const outlinks = parseOutlinks(text);
       notes.push({ path: relPath, basename, jdId, aliases, outlinks, frontmatter: full });
     }

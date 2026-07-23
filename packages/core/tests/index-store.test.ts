@@ -154,13 +154,45 @@ test("buildIndex: ignores .obsidian/ and other hidden dirs", async () => {
 });
 
 test("buildIndex: duplicate JD-IDs warn but second-wins", async () => {
-  await writeNote("a.md", "---\njd-id: 99.01\n---\nA.");
-  await writeNote("b.md", "---\njd-id: 99.01\n---\nB.");
+  // JD id is derived from the filename prefix (filename-canonical). The same id
+  // appearing in two folders is a JD-invariant violation we still index second-wins.
+  await writeNote("a/99.01 First.md", "A.");
+  await writeNote("b/99.01 Second.md", "B.");
   await indexStore.buildIndex();
-  // Path-sorted walk means a.md is indexed first, b.md second. Second wins.
+  // Path-sorted walk means "a/…" is indexed first, "b/…" second. Second wins.
   const r = indexStore.resolveRefs(["99.01"])[0];
-  assert.equal(r.path, "b.md");
+  assert.equal(r.path, "b/99.01 Second.md");
   assert.equal(r.matched_by, "jd-id");
+});
+
+test("deriveJdIdFromPath: id / project / area / category / none", () => {
+  const d = indexStore.deriveJdIdFromPath;
+  // id note: "NN.NN <title>"
+  assert.equal(d("04 Obsidian tooling/04.18 obsidian-execute-code.md", "04.18 obsidian-execute-code"), "04.18");
+  // project note: 5-digit prefix inside an expanded area (90-99)
+  assert.equal(d("90-99 Software/92208 Concept note.md", "92208 Concept note"), "92208");
+  // expanded *category* (27) also uses 5-digit ids
+  assert.equal(d("20-29 People/27 Foo/27001 Bar.md", "27001 Bar"), "27001");
+  // fractal / sub-project inside an expanded area
+  assert.equal(d("90-99 Software/92004 jd/92004.01 Child.md", "92004.01 Child"), "92004.01");
+  // fractal in an expanded *category* (27) is NOT valid — fractal ids are
+  // expanded-area-only, matching jd-numbering's parseJdId
+  assert.equal(d("20-29 People/27 Foo/27001.10 Bar.md", "27001.10 Bar"), undefined);
+  // area folder note: the note is its own folder note, "A0-A9 <title>"
+  assert.equal(d("00-09 System/00-09 System.md", "00-09 System"), "00-09");
+  // category folder note: "<area>/<NN …>/<NN …>" → "NN.00"
+  assert.equal(d("00-09 System/00 System management/00 System management.md", "00 System management"), "00.00");
+  // id-level folder note (three-segment folder, "NN.NN …" basename) → "NN.NN", not "NN.00"
+  assert.equal(
+    d("00-09 System/00 System management/00.05 Agents/00.05 Agents.md", "00.05 Agents"),
+    "00.05",
+  );
+  // 5-digit prefix OUTSIDE an expanded area/category is NOT a JD id
+  assert.equal(d("10-19 Personal/10000 Hours.md", "10000 Hours"), undefined);
+  // no JD prefix → undefined
+  assert.equal(d("some/random note.md", "random note"), undefined);
+  // a bare "NN.NN.md" (no title after the id) is not an id note
+  assert.equal(d("04.18.md", "04.18"), undefined);
 });
 
 // =============================================================================
@@ -177,13 +209,12 @@ test("resolveRefs: exact path (with and without .md)", async () => {
   assert.equal(withoutExt.matched_by, "path");
 });
 
-test("resolveRefs: path wins when both a basename-matching file AND a jd-id-tagged file exist", async () => {
+test("resolveRefs: path wins when both a basename-matching file AND a jd-id file exist", async () => {
   // Resolution order is path → jd-id → basename → alias. A file literally
   // named "92.05.md" causes the `working + '.md'` path attempt to hit first,
-  // even when another note's frontmatter has jd-id: 92.05. This pins that
-  // priority — useful baseline for the upcoming incremental path.
-  await writeNote("a.md", "---\njd-id: 92.05\n---\nA.");
-  await writeNote("92.05.md", "B."); // basename equals the JD-ID
+  // even when another note's filename ("92.05 Real.md") derives jd-id 92.05.
+  await writeNote("92.05 Real.md", "A."); // filename-derived jd-id 92.05
+  await writeNote("92.05.md", "B.");      // basename equals the JD-ID literally
   await indexStore.buildIndex();
   const r = indexStore.resolveRefs(["92.05"])[0];
   assert.equal(r.path, "92.05.md");
@@ -300,15 +331,15 @@ test("applyAddOrChange: new file lands in every forward map + backlinks", async 
   assert.equal(indexStore.indexStatus().count, 0);
 
   // Now apply via incremental ops, simulating chokidar add events.
-  await writeNote("A.md", "---\naliases: [Alpha]\njd-id: 92.05\n---\nLinking to [[B]].");
+  await writeNote("92.05 A.md", "---\naliases: [Alpha]\n---\nLinking to [[B]].");
   await writeNote("B.md", "B.");
-  await indexStore.applyAddOrChange(abs("A.md"));
+  await indexStore.applyAddOrChange(abs("92.05 A.md"));
   await indexStore.applyAddOrChange(abs("B.md"));
 
   assert.equal(indexStore.indexStatus().count, 2);
-  assert.equal(indexStore.resolveRefs(["Alpha"])[0].path, "A.md");
-  assert.equal(indexStore.resolveRefs(["92.05"])[0].path, "A.md");
-  assert.deepEqual(indexStore.getBacklinks("B.md"), ["A.md"]);
+  assert.equal(indexStore.resolveRefs(["Alpha"])[0].path, "92.05 A.md");
+  assert.equal(indexStore.resolveRefs(["92.05"])[0].path, "92.05 A.md");
+  assert.deepEqual(indexStore.getBacklinks("B.md"), ["92.05 A.md"]);
 });
 
 test("applyAddOrChange: equivalent to buildIndex on the same disk state", async () => {
@@ -318,8 +349,8 @@ test("applyAddOrChange: equivalent to buildIndex on the same disk state", async 
   await writeNote("a/Ambig.md", "x");
   await writeNote("b/Ambig.md", "y");
   await writeNote(
-    "Z.md",
-    "---\nstatus: active\ntags:\n  - alpha\n  - bravo\njd-id: 99.05\n---\nZ links to [[Y]] too."
+    "99.05 Z.md",
+    "---\nstatus: active\ntags:\n  - alpha\n  - bravo\n---\nZ links to [[Y]] too."
   );
 
   // Path 1: incremental.
@@ -327,7 +358,7 @@ test("applyAddOrChange: equivalent to buildIndex on the same disk state", async 
   await indexStore.applyAddOrChange(abs("Y.md"));
   await indexStore.applyAddOrChange(abs("a/Ambig.md"));
   await indexStore.applyAddOrChange(abs("b/Ambig.md"));
-  await indexStore.applyAddOrChange(abs("Z.md"));
+  await indexStore.applyAddOrChange(abs("99.05 Z.md"));
   const incCount = indexStore.indexStatus().count;
   const incBacklinks = indexStore.getBacklinks("Y.md");
   const incOutlinks = indexStore.getOutlinks("X.md");
@@ -489,17 +520,16 @@ test("getBacklinks order matches buildIndex order after incremental ops", async 
 });
 
 test("applyAddOrChange: duplicate jd-id is accepted; second-wins like full rebuild", async () => {
-  await writeNote("first.md", "---\njd-id: 77.07\n---\nfirst");
+  await writeNote("a/77.07 First.md", "first");
   await indexStore.buildIndex();
-  assert.equal(indexStore.resolveRefs(["77.07"])[0].path, "first.md");
+  assert.equal(indexStore.resolveRefs(["77.07"])[0].path, "a/77.07 First.md");
 
-  // A second file claims the same jd-id incrementally.
-  await writeNote("second.md", "---\njd-id: 77.07\n---\nsecond");
-  await indexStore.applyAddOrChange(abs("second.md"));
+  // A second file in another folder derives the same jd-id incrementally.
+  await writeNote("b/77.07 Second.md", "second");
+  await indexStore.applyAddOrChange(abs("b/77.07 Second.md"));
 
-  // Second-wins, matching buildIndex's path-sorted behavior in the duplicate
-  // case (here it's the incremental insertion order).
-  assert.equal(indexStore.resolveRefs(["77.07"])[0].path, "second.md");
+  // Second-wins: the lexically-later path ("b/…") overrides the earlier winner.
+  assert.equal(indexStore.resolveRefs(["77.07"])[0].path, "b/77.07 Second.md");
 });
 
 // =============================================================================
@@ -513,11 +543,13 @@ test("#27 parseAllFrontmatter: unquoted jd-id with leading zero stays a string",
   assert.equal(fm["jd-id"], "03.05", 'jd-id should remain "03.05", not become 3.05');
 });
 
-test("#27 resolveRefs: unquoted jd-id 03.05 is resolvable by the string '03.05'", async () => {
-  await writeNote("slot.md", "---\njd-id: 03.05\n---\nBody.");
+test("#27 resolveRefs: leading-zero jd-id 03.05 is resolvable by the string '03.05'", async () => {
+  // Filename-canonical: the id derives from the "03.05" filename prefix, and the
+  // leading zero must survive (never coerced to the float 3.05).
+  await writeNote("03.05 Agents.md", "Body.");
   await indexStore.buildIndex();
   const r = indexStore.resolveRefs(["03.05"])[0];
-  assert.equal(r.path, "slot.md");
+  assert.equal(r.path, "03.05 Agents.md");
   assert.equal(r.matched_by, "jd-id");
 });
 
@@ -534,21 +566,21 @@ test("#27 searchByFrontmatter: unquoted jd-id 03.05 findable by string value '03
 // =============================================================================
 
 test("#28 duplicate jd-id: incremental re-add of loser doesn't override winner", async () => {
-  // A.md < B.md lexically → buildIndex processes A first, B last → B wins.
-  await writeNote("A.md", "---\njd-id: 55.01\n---\nA");
-  await writeNote("B.md", "---\njd-id: 55.01\n---\nB");
+  // "a/…" < "b/…" lexically → buildIndex processes a first, b last → b wins.
+  await writeNote("a/55.01 A.md", "A");
+  await writeNote("b/55.01 B.md", "B");
   await indexStore.buildIndex();
   assert.equal(
     indexStore.resolveRefs(["55.01"])[0].path,
-    "B.md",
-    "full rebuild: B.md (sorted-last) should win",
+    "b/55.01 B.md",
+    "full rebuild: b/… (sorted-last) should win",
   );
 
-  // Incrementally re-apply the loser (A.md). The winner (B.md) must not change.
-  await indexStore.applyAddOrChange(abs("A.md"));
+  // Incrementally re-apply the loser (a/…). The winner (b/…) must not change.
+  await indexStore.applyAddOrChange(abs("a/55.01 A.md"));
   assert.equal(
     indexStore.resolveRefs(["55.01"])[0].path,
-    "B.md",
-    "after incremental re-add of loser, B.md must still win",
+    "b/55.01 B.md",
+    "after incremental re-add of loser, b/… must still win",
   );
 });

@@ -7,7 +7,7 @@
  */
 
 import { TFile, TFolder, getAllTags, type App } from "obsidian";
-import { CHARACTER_LIMIT } from "@vault-mcp/core";
+import { CHARACTER_LIMIT, deriveJdIdFromPath } from "@vault-mcp/core";
 import { backlinkKeys } from "./helpers.js";
 import type {
   VaultBackend,
@@ -181,13 +181,14 @@ export class ObsidianBackend implements VaultBackend {
 
       // Determine matched_by — mirrors the discriminants used by index-store._resolveRefs
       // so both backends emit the same vocabulary: "path" | "basename" | "alias" | "jd-id".
+      // The JD id is derived from the filename + note-kind (filename-canonical),
+      // not read from a frontmatter property.
       let matched_by: ResolveResult["matched_by"];
       if (clean === dest.path || clean + ".md" === dest.path) {
         matched_by = "path";
       } else {
-        const fm = this.app.metadataCache.getFileCache(dest)?.frontmatter;
-        const jdId = fm ? fm["jd-id"] : undefined;
-        if (jdId !== undefined && String(jdId) === clean) {
+        const jdId = deriveJdIdFromPath(dest.path, dest.basename);
+        if (jdId !== undefined && jdId === clean) {
           matched_by = "jd-id";
         } else if (dest.basename.toLowerCase() === clean.toLowerCase()) {
           matched_by = "basename";
