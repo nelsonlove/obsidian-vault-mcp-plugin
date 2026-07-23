@@ -67,6 +67,7 @@ export {
   applyUnlink,
   parseAllFrontmatter,
   parseOutlinks,
+  deriveJdIdFromPath,
   IndexStore,
 } from "./fs-backend/index-store.js";
 export type { IndexStatus, IndexedNote } from "./fs-backend/index-store.js";
