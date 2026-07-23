@@ -236,12 +236,6 @@ function parseFrontmatter(text: string): { aliases: string[]; full: Record<strin
 const EXPANDED_AREAS = new Set(["90-99"]);
 const EXPANDED_CATEGORIES = new Set(["27"]);
 
-function isExpandedFiveDigit(prefix: string): boolean {
-  const cat = prefix.slice(0, 2);
-  const area = `${cat[0]}0-${cat[0]}9`;
-  return EXPANDED_AREAS.has(area) || EXPANDED_CATEGORIES.has(cat);
-}
-
 /**
  * Derive a note's canonical JD id from its filename + folder, replicating the
  * vault's JD model (jd-numbering `parseJdId` / `canonicalFolderNoteId` and the
@@ -274,10 +268,19 @@ export function deriveJdIdFromPath(relPath: string, basename: string): string | 
   // Id note: "NN.NN <title>".
   const idMatch = basename.match(/^(\d{2}\.\d{2}) /);
   if (idMatch) return idMatch[1];
-  // Project / expanded-item note: "NNNNN <title>" (optionally NNNNN.NN), but
-  // only inside an expanded area/category.
-  const projMatch = basename.match(/^(\d{5}(?:\.\d{2})?) /);
-  if (projMatch && isExpandedFiveDigit(projMatch[1])) return projMatch[1];
+  // Project / expanded-item note: "NNNNN <title>". Matches jd-numbering's model
+  // (parseJdId): a flat 5-digit id is valid in an expanded area OR category; a
+  // fractal "NNNNN.NN" id is valid only in an expanded AREA.
+  const projMatch = basename.match(/^(\d{5})(\.\d{2})? /);
+  if (projMatch) {
+    const cat = projMatch[1].slice(0, 2);
+    const area = `${cat[0]}0-${cat[0]}9`;
+    if (projMatch[2]) {
+      if (EXPANDED_AREAS.has(area)) return projMatch[1] + projMatch[2];
+    } else if (EXPANDED_AREAS.has(area) || EXPANDED_CATEGORIES.has(cat)) {
+      return projMatch[1];
+    }
+  }
   return undefined;
 }
 

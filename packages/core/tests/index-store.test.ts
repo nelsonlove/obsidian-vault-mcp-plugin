@@ -175,6 +175,9 @@ test("deriveJdIdFromPath: id / project / area / category / none", () => {
   assert.equal(d("20-29 People/27 Foo/27001 Bar.md", "27001 Bar"), "27001");
   // fractal / sub-project inside an expanded area
   assert.equal(d("90-99 Software/92004 jd/92004.01 Child.md", "92004.01 Child"), "92004.01");
+  // fractal in an expanded *category* (27) is NOT valid — fractal ids are
+  // expanded-area-only, matching jd-numbering's parseJdId
+  assert.equal(d("20-29 People/27 Foo/27001.10 Bar.md", "27001.10 Bar"), undefined);
   // area folder note: the note is its own folder note, "A0-A9 <title>"
   assert.equal(d("00-09 System/00-09 System.md", "00-09 System"), "00-09");
   // category folder note: "<area>/<NN …>/<NN …>" → "NN.00"
