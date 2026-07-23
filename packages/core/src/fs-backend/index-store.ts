@@ -228,17 +228,33 @@ function parseFrontmatter(text: string): { aliases: string[]; full: Record<strin
   return { aliases, full };
 }
 
+// Areas/categories that use 5-digit ("expanded") ids, mirroring the
+// jd-numbering plugin's DEFAULT_CONFIG (obsidian-jd-numbering src/jd.ts). A
+// 5-digit filename prefix is only a JD id inside one of these; elsewhere it is
+// just a title that happens to start with digits — "10000 Hours.md" is NOT id
+// 10000. Keep in sync with jd-numbering; the two are the vault's canonical model.
+const EXPANDED_AREAS = new Set(["90-99"]);
+const EXPANDED_CATEGORIES = new Set(["27"]);
+
+function isExpandedFiveDigit(prefix: string): boolean {
+  const cat = prefix.slice(0, 2);
+  const area = `${cat[0]}0-${cat[0]}9`;
+  return EXPANDED_AREAS.has(area) || EXPANDED_CATEGORIES.has(cat);
+}
+
 /**
  * Derive a note's canonical JD id from its filename + folder, replicating the
- * vault's `jd-id vs filename.base` kind classifier. The filename is canonical;
- * the id is a pure function of (path, note-kind):
+ * vault's JD model (jd-numbering `parseJdId` / `canonicalFolderNoteId` and the
+ * `jd-id vs filename.base` classifier). The filename is canonical; the id is a
+ * pure function of (path, note-kind):
  *   - area folder note      ("00-09 System/00-09 System.md")          → "00-09"
  *   - category folder note  ("…/00 System management/00 System …")    → "00.00"
  *   - id note               ("04.18 obsidian-execute-code.md")        → "04.18"
  *   - project note          ("92208 Concept note.md")                 → "92208"
- * Returns undefined for notes with no JD prefix. This replaced the former
- * frontmatter `jd-id` lookup when that property was retired in favour of the
- * filename being canonical.
+ * A 5-digit prefix only counts inside an expanded area/category (see above);
+ * "NN.NN"-prefixed names always count (matching the vault model). Returns
+ * undefined for notes with no JD prefix. This replaced the former frontmatter
+ * `jd-id` lookup when that property was retired in favour of filename-canonical.
  */
 export function deriveJdIdFromPath(relPath: string, basename: string): string | undefined {
   const slash = relPath.lastIndexOf("/");
@@ -249,16 +265,19 @@ export function deriveJdIdFromPath(relPath: string, basename: string): string | 
     if (m) return m[1];
   }
   // Category folder note: folder ends with "/<basename>" and the folder path is
-  // "<area>/<NN …>" (area then category, two levels down).
+  // "<area>/<NN …>" (area then category, exactly two levels). An id-level folder
+  // note (three-segment folder, "NN.NN …" basename) fails this and falls to the
+  // id branch below, correctly yielding "NN.NN" rather than "NN.00".
   if (folder.endsWith("/" + basename) && /^\d0-\d9 [^/]+\/\d{2} [^/]+$/.test(folder)) {
     return basename.slice(0, 2) + ".00";
   }
   // Id note: "NN.NN <title>".
   const idMatch = basename.match(/^(\d{2}\.\d{2}) /);
   if (idMatch) return idMatch[1];
-  // Project note: "NNNNN <title>" (optionally NNNNN.NN).
+  // Project / expanded-item note: "NNNNN <title>" (optionally NNNNN.NN), but
+  // only inside an expanded area/category.
   const projMatch = basename.match(/^(\d{5}(?:\.\d{2})?) /);
-  if (projMatch) return projMatch[1];
+  if (projMatch && isExpandedFiveDigit(projMatch[1])) return projMatch[1];
   return undefined;
 }
 

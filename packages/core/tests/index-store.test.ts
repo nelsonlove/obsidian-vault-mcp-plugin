@@ -169,12 +169,23 @@ test("deriveJdIdFromPath: id / project / area / category / none", () => {
   const d = indexStore.deriveJdIdFromPath;
   // id note: "NN.NN <title>"
   assert.equal(d("04 Obsidian tooling/04.18 obsidian-execute-code.md", "04.18 obsidian-execute-code"), "04.18");
-  // project note: 5-digit prefix
-  assert.equal(d("70-79 Hobbies/92208 Concept note.md", "92208 Concept note"), "92208");
+  // project note: 5-digit prefix inside an expanded area (90-99)
+  assert.equal(d("90-99 Software/92208 Concept note.md", "92208 Concept note"), "92208");
+  // expanded *category* (27) also uses 5-digit ids
+  assert.equal(d("20-29 People/27 Foo/27001 Bar.md", "27001 Bar"), "27001");
+  // fractal / sub-project inside an expanded area
+  assert.equal(d("90-99 Software/92004 jd/92004.01 Child.md", "92004.01 Child"), "92004.01");
   // area folder note: the note is its own folder note, "A0-A9 <title>"
   assert.equal(d("00-09 System/00-09 System.md", "00-09 System"), "00-09");
   // category folder note: "<area>/<NN …>/<NN …>" → "NN.00"
   assert.equal(d("00-09 System/00 System management/00 System management.md", "00 System management"), "00.00");
+  // id-level folder note (three-segment folder, "NN.NN …" basename) → "NN.NN", not "NN.00"
+  assert.equal(
+    d("00-09 System/00 System management/00.05 Agents/00.05 Agents.md", "00.05 Agents"),
+    "00.05",
+  );
+  // 5-digit prefix OUTSIDE an expanded area/category is NOT a JD id
+  assert.equal(d("10-19 Personal/10000 Hours.md", "10000 Hours"), undefined);
   // no JD prefix → undefined
   assert.equal(d("some/random note.md", "random note"), undefined);
   // a bare "NN.NN.md" (no title after the id) is not an id note
