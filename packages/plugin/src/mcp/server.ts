@@ -13,7 +13,7 @@ import { registerImportTools, IMPORTER_PLUGIN_ID } from "./tools-import.js";
 import { registerCliTools, obsidianTemplateReader } from "./tools-cli.js";
 import { registerCliDedicatedTools } from "./tools-cli-dedicated.js";
 import { registerSnippetTools, obsidianSnippetSource } from "./tools-snippets.js";
-import { registerExternalTools } from "./external-tools.js";
+import { registerExternalTools, externalToolSnapshot } from "./external-tools.js";
 import { registerLockTools } from "./tools-locks.js";
 import { registerUidTools } from "./tools-uid.js";
 import { registerPendingReviewTools, obsidianPendingReviewSource } from "./tools-pending-review.js";
@@ -41,6 +41,8 @@ import { ObsidianBackend } from "./obsidian-backend.js";
 import { registerWriteNotesTool, type GuardedWrite } from "./tools-write-notes.js";
 import { uuidv7, formatLocalTimestamp } from "./write-notes-compose.js";
 import { makeRegistry, DEFAULT_SCHEMES } from "../kernel/scheme/registry.js";
+import { buildMcpActionRegistry } from "../kernel/operations/mcp-registry.js";
+import { createOperationExecutor } from "../kernel/operations/executor.js";
 
 export interface BuildOpts {
   /** Code Mode: expose the search/describe/call meta-tool surface instead of the full tool set. */
@@ -115,10 +117,33 @@ export function buildMcpServer(app: App, ctx: ServerCtx, opts: BuildOpts = {}): 
   // Named so obsidian_write_notes' pre-compose resolve (below) can share the
   // IDENTICAL uid/scheme resolution + read-only/allowlist check `guarded`
   // itself applies — not a second copy of it.
+  // ── the operation seam (WP1) ────────────────────────────────────────────────
+  //
+  // One registry and one executor per CONNECTION, matching the lifetime of the
+  // server itself. That is not incidental: a third-party publisher's tool names
+  // are computed from whichever plugins are loaded right now, so they only
+  // exist at this moment. Binding them here keeps the executor's lookup exact
+  // for every surface — including the ones that are not in this repository.
+  //
+  // Registry problems are reported the way the module host already reports its
+  // own: loudly, to the console, without costing the connection. The declared
+  // inventory's correctness is a BUILD property with its own test; re-deciding
+  // it per connection would turn a build failure into a runtime outage.
+  const actions = buildMcpActionRegistry(externalToolSnapshot(ctx));
+  for (const p of actions.problems) console.error("[governor] action registry:", p);
+  const executor = createOperationExecutor({
+    registry: actions.registry,
+    actor: () => {
+      const a = actor();
+      return { binding: `${a.connection}`, clientClaim: a.client ?? null };
+    },
+  });
+
   const guardedOpts = {
     getSettings: () => ctx.getSettings(),
     kernel: ctx.kernel,
     actor,
+    executor,
     // `jd:<address>` addressing at the interception point: same per-call
     // freshness as registerSchemeTools's own registry() below (a scheme
     // config edit lands live), and the same notes() source it uses.

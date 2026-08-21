@@ -125,6 +125,28 @@ export class ExternalToolRegistry {
 // tool-name form: two ids that sanitize alike must not inherit one another's
 // trust. The setting is read at connection-build time, like the tool snapshot
 // itself, so a trust change takes effect on the next session connect.
+
+/**
+ * The connection's external-tool snapshot, with the host's trust decision
+ * already applied.
+ *
+ * Exported so the per-connection action registry and the registrar decide
+ * "is this tool read-only" from ONE definition. Two copies of that rule would
+ * be two chances to disagree, and the disagreement that matters is the registry
+ * inventorying a tool as read-only while the guard treats it as mutating.
+ *
+ * `readOnly` here is the HOST's conclusion — the publisher claimed it AND the
+ * user trusts that publisher — never the publisher's assertion alone.
+ */
+export function externalToolSnapshot(ctx: ServerCtx): Array<{ name: string; owner: string; readOnly: boolean }> {
+  const trusted = new Set(ctx.getSettings().trustedReadOnlyPlugins ?? []);
+  return (ctx.getExternalTools?.() ?? []).map(({ ownerId, toolName, spec }) => ({
+    name: toolName,
+    owner: ownerId,
+    readOnly: spec.annotations?.readOnlyHint === true && trusted.has(ownerId),
+  }));
+}
+
 export function registerExternalTools(server: McpServer, app: App, ctx: ServerCtx): void {
   const entries = ctx.getExternalTools?.() ?? [];
   const trusted = new Set(ctx.getSettings().trustedReadOnlyPlugins ?? []);

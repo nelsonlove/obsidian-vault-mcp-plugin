@@ -82,6 +82,15 @@ export interface ActionRegistry {
   /** Look up one action. Returns undefined rather than throwing — callers that
    * need a refusal make it themselves, with their own error type. */
   get(id: string, version: number): ActionDefinition | undefined;
+  /**
+   * Look up one binding by surface id.
+   *
+   * Indexed rather than scanned. The executor resolves a binding on EVERY
+   * invocation — including reads, which previously bypassed the queue and the
+   * journal entirely — so a linear scan over the whole binding set would put
+   * new fixed cost on the cheapest path in the product.
+   */
+  binding(surfaceId: string): SurfaceBinding | undefined;
 }
 
 export function createActionRegistry(): ActionRegistry {
@@ -311,6 +320,18 @@ export function createActionRegistry(): ActionRegistry {
     return problems;
   }
 
+  /** Rebuilt whenever the binding list grows, so an unsealed registry (tests,
+   * per-connection construction) still resolves correctly. */
+  let bindingIndex: Map<string, SurfaceBinding> | null = null;
+  let indexedAt = -1;
+  function binding(surfaceId: string): SurfaceBinding | undefined {
+    if (bindingIndex === null || indexedAt !== bindings.length) {
+      bindingIndex = new Map(bindings.map((b) => [b.id, b]));
+      indexedAt = bindings.length;
+    }
+    return bindingIndex.get(surfaceId);
+  }
+
   return {
     register,
     bind,
@@ -318,5 +339,6 @@ export function createActionRegistry(): ActionRegistry {
     actions: () => actionOrder.map((k) => actions.get(k)!),
     bindings: () => [...bindings],
     get: (id, version) => actions.get(actionKey(id, version)),
+    binding,
   };
 }
