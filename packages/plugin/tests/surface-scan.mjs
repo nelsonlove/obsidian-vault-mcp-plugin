@@ -84,6 +84,26 @@ export const KNOWN_PASSTHROUGH_SITES = [
   },
 ];
 
+
+/**
+ * Read a file that a concurrent test may be deleting underneath us.
+ *
+ * Test files run in parallel processes, and two of them plant and remove
+ * scratch `.ts` files inside `src/` to prove their scanners still match. A
+ * file can therefore be present when the glob enumerates it and gone by the
+ * time it is read. That is not a registration and not a scanner failure — it
+ * is a file that no longer exists — so ENOENT is skipped and every other error
+ * still propagates.
+ */
+async function readMaybe(abs) {
+  try {
+    return await readFile(abs, "utf8");
+  } catch (e) {
+    if (e?.code === "ENOENT") return null;
+    throw e;
+  }
+}
+
 async function tsFiles(root) {
   const out = [];
   for await (const rel of glob("**/*.ts", { cwd: root })) out.push({ rel, abs: resolvePath(root, rel) });
@@ -210,7 +230,8 @@ export async function scanMcpSurfaces() {
   const parsed = [];
 
   for (const f of files) {
-    const text = await readFile(f.abs, "utf8");
+    const text = await readMaybe(f.abs);
+    if (text === null) continue;
     parsed.push({ ...f, text, ...presetsIn(text) });
     for (const [k, v] of stringConstsIn(text)) globalConsts.set(k, v);
   }
@@ -347,8 +368,8 @@ export async function scanUnknownRegistrationCallees() {
   const found = [];
   const re = /(?:[A-Za-z_$][\w$]*\.)?\b([A-Za-z_$][\w$]*)\(\s*"([a-z][a-z0-9]*(?:_[a-z0-9]+)+)"\s*,/g;
   for (const f of files) {
-
-    const text = await readFile(f.abs, "utf8");
+    const text = await readMaybe(f.abs);
+    if (text === null) continue;
     let m;
     while ((m = re.exec(text))) {
       if (classified.has(m[1])) continue;
@@ -356,4 +377,137 @@ export async function scanUnknownRegistrationCallees() {
     }
   }
   return found;
+}
+
+// ── non-MCP surfaces (WP0, second half) ──────────────────────────────────────
+//
+// MCP is one door. Obsidian commands are another — and a more consequential
+// one than it looks, because `obsidian_run_command` executes any command by id
+// through `executeCommandById`, so every command this plugin registers is also
+// reachable from an agent session. The accept path deliberately registers none.
+
+/**
+ * Every Obsidian command the plugin registers, from `addCommand({ id: "…" })`.
+ *
+ * Both the multi-line form (`main.ts`) and the single-line form
+ * (`skills/wiring.ts`, `scheme/wiring.ts`) occur, so the id is matched within
+ * the object literal rather than at a fixed offset.
+ */
+export async function scanCommands() {
+  const files = (await tsFiles(PLUGIN_SRC)).map((f) => ({ ...f, rel: `src/${f.rel}` }));
+  const found = new Map();
+  const re = /addCommand\(\s*\{[\s\S]{0,400}?\bid:\s*"([a-z][a-z0-9-]*)"/g;
+  for (const f of files) {
+    const text = await readMaybe(f.abs);
+    if (text === null) continue;
+    let m;
+    while ((m = re.exec(text))) found.set(m[1], { id: m[1], file: f.rel });
+  }
+  return found;
+}
+
+/**
+ * Commands registered from anywhere under `src/governance/`.
+ *
+ * Expected to be EMPTY, permanently. This is the inverse of an inventory: the
+ * assertion is that a whole class of surface does not exist, because
+ * `obsidian_run_command` would make it agent-invocable.
+ */
+export async function scanGovernanceCommands() {
+  const commands = await scanCommands();
+  return [...commands.values()].filter((c) => c.file.startsWith("src/governance/"));
+}
+
+/**
+ * Check that named functions exist in a file and are NOT exported.
+ *
+ * Export is the difference between "a module-scope function only a closure can
+ * call" and "a function reachable from any object that can import the module."
+ * For the accept perimeter that difference is the whole reachability control,
+ * so it is checked rather than trusted.
+ */
+export async function scanModuleScopeOnly(relPath, names) {
+  const text = await readFile(resolvePath(PLUGIN_SRC, relPath), "utf8");
+  const present = new Set();
+  const exported = new Set();
+  for (const name of names) {
+    if (new RegExp(`\\bfunction\\s+${name}\\b`).test(text)) present.add(name);
+    if (new RegExp(`\\bexport\\s+(?:async\\s+)?(?:function|const|let)\\s+${name}\\b`).test(text)) exported.add(name);
+    if (new RegExp(`\\bexport\\s*\\{[^}]*\\b${name}\\b[^}]*\\}`).test(text)) exported.add(name);
+  }
+  return { present, exported };
+}
+
+/**
+ * Every place work can start with no caller: an event subscription, an armed
+ * timer, or a layout-ready hook.
+ *
+ * Comment lines are excluded — several of this repo's densest headers discuss
+ * `onLayoutReady` at length, and counting prose as an entry point would make
+ * the inventory noise rather than signal.
+ */
+export async function scanAutomationSites() {
+  const files = (await tsFiles(PLUGIN_SRC)).map((f) => ({ ...f, rel: `src/${f.rel}` }));
+  const found = [];
+  const re = /\b(registerEvent|registerInterval|onLayoutReady)\s*\(|\bwindow\.setInterval\s*\(/;
+  for (const f of files) {
+    const text = await readMaybe(f.abs);
+    if (text === null) continue;
+    for (const line of text.split("\n")) {
+      const trimmed = line.trim();
+      if (trimmed.startsWith("//") || trimmed.startsWith("*") || trimmed.startsWith("/*")) continue;
+      const m = re.exec(line);
+      if (m) found.push({ kind: m[1] ?? "setInterval", file: f.rel });
+    }
+  }
+  return found;
+}
+
+/**
+ * Which of the named module-scope functions reach a given callee.
+ *
+ * Used to VERIFY, rather than trust, the inventory's claim about which
+ * authority acts leave a durable audit record. The earlier draft asserted
+ * "the acceptance log records these" in a comment and applied it to all of
+ * them; two were wrong. A claim about existing behaviour belongs in a scan.
+ *
+ * Bodies are delimited by this file's own style — a module-scope
+ * `function name(` through the next `}` at column 0 — which holds throughout
+ * `governance/wiring.ts`. A function whose body cannot be delimited is
+ * reported as `null` rather than silently treated as not calling anything.
+ *
+ * `delegates` names indirect routes: `performAccept` does not call `appendLog`
+ * itself, it calls `acceptNote`, which appends through its injected deps. Each
+ * delegate is listed explicitly rather than followed automatically, because a
+ * scanner that chases call graphs would quietly start guessing.
+ */
+export async function scanFunctionReaches(relPath, fnNames, callees) {
+  const text = await readFile(resolvePath(PLUGIN_SRC, relPath), "utf8");
+  const out = new Map();
+  for (const fn of fnNames) {
+    const start = text.search(new RegExp(`^(?:export\\s+)?(?:async\\s+)?function\\s+${fn}\\s*\\(`, "m"));
+    if (start < 0) {
+      out.set(fn, null);
+      continue;
+    }
+    const rest = text.slice(start);
+    const endRel = rest.search(/\n\}/);
+    if (endRel < 0) {
+      out.set(fn, null);
+      continue;
+    }
+    const body = rest.slice(0, endRel);
+    out.set(fn, new Set(callees.filter((c) => new RegExp(`\\b${c}\\s*\\(`).test(body))));
+  }
+  return out;
+}
+
+/** Every `export` from one file, so a NEW export is a visible decision. */
+export async function scanExports(relPath) {
+  const text = await readFile(resolvePath(PLUGIN_SRC, relPath), "utf8");
+  const names = new Set();
+  const re = /^export\s+(?:async\s+)?(?:function|const|let|class|interface|type)\s+([A-Za-z_$][\w$]*)/gm;
+  let m;
+  while ((m = re.exec(text))) names.add(m[1]);
+  return names;
 }
