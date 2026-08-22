@@ -26,6 +26,7 @@
 // exactly-one-winner property carries the claim-level one.
 
 import { createAdmissionService, type AdmissionService } from "../kernel/governance/admission/service.js";
+import { standingHealth, type StandingHealthReport } from "../kernel/governance/admission/standing-health.js";
 import { freezeCohort, excludeAndRefreeze, type FrozenCohort, type FreezeInput } from "../kernel/governance/cohorts/freeze.js";
 import { verifyCohortCoverage } from "../kernel/governance/cohorts/coverage.js";
 import { selectProposals, type CohortSelector } from "../kernel/governance/cohorts/cohort.js";
@@ -55,6 +56,8 @@ export interface AdmissionUiDeps {
    * admitWithGesture; the gestureRef arrives from the gate.
    */
   admitCohortWithGesture(frozen: FrozenCohort, members: ProposalV1[], gestureRef: string): Promise<CohortAdmitOutcome>;
+  /** #337 option 4 — claims-exist-chain-absent surfaced as critical. */
+  standingHealth(): Promise<StandingHealthReport>;
   /** Split by finding: exclude members and produce the successor decision. */
   refreezeWithout(frozen: FrozenCohort, members: ProposalV1[], excludeProposalIds: string[], recoveryUnit: "item" | "cohort"): Promise<{ ok: true; frozen: FrozenCohort; members: ProposalV1[] } | { ok: false; reason: string }>;
   /**
@@ -271,6 +274,26 @@ export function buildAdmission(deps: BuildAdmissionDeps): AdmissionUiDeps {
       } catch (e) {
         return { ok: false, reason: e instanceof Error ? e.message : String(e) };
       }
+    },
+
+    async standingHealth(): Promise<StandingHealthReport> {
+      // #337 option 4: the chain-absent direction surfaced as CRITICAL. The
+      // chain reader reuses claimIdOf — one canonical parse of the standing
+      // commit message, never a second regex.
+      return standingHealth({
+        claims,
+        standingChain: async () => {
+          const repo = await deps.repo();
+          const head = await repo.resolveRef(standingRef());
+          if (head === null) return [];
+          const ids: string[] = [];
+          for (const entry of await repo.log(standingRef(), 100000)) {
+            const id = await claimIdOf(repo, entry.oid);
+            if (id !== null) ids.push(id);
+          }
+          return ids;
+        },
+      });
     },
 
     async admitCohortWithGesture(frozen, members, gestureRef) {

@@ -22,7 +22,8 @@ import type { HistoryRepository } from "./kernel/governance/history-store/reposi
 import { obsidianProbe, obsidianServerIdentity, obsidianUidSource } from "./kernel/obsidian-probe.js";
 import { DEFAULT_SCHEMES, type SchemeInstanceConfig } from "./kernel/scheme/registry.js";
 import { DEFAULT_PROTECTED_PROPERTIES, setDeclaredProtectedProperties } from "@vault-mcp/core";
-import { wireGovernance, nudgeGovernanceQueue } from "./governance/wiring.js";
+import { wireGovernance, nudgeGovernanceQueue, setLegacyWriteGuard, baselinesOf } from "./governance/wiring.js";
+import { buildMigration, type Migration } from "./governance/migration-wiring.js";
 import { mountAction } from "./governance/mount-state.js";
 import { wireSkills } from "./skills/wiring.js";
 import { wireSchemePanes, registerSchemeCommands } from "./scheme/wiring.js";
@@ -149,6 +150,8 @@ interface VaultMcpSettings {
 // module-local WeakMap (the wiring.ts pattern) — NOT a plugin property, so
 // renderer JS walking `app.plugins` finds no admit-capable function (§9).
 const admissionFactories = new WeakMap<Plugin, () => AdmissionUiDeps>();
+// WP8: per-plugin migration surface (import / cutover / rollback), built in onload.
+const migrations = new WeakMap<Plugin, Migration>();
 
 const DEFAULT_SETTINGS: VaultMcpSettings = {
   setupAcknowledged: false,
@@ -589,6 +592,42 @@ export default class VaultMcpPlugin extends Plugin {
       },
     };
     const acceptanceLogFile = `${pluginDir}/governance/acceptance-log.jsonl`;
+
+    // WP8: the migration surface — legacy evidence import + the
+    // human-confirmed authority cutover. Built here (adapter-backed stores
+    // beside the other governance files, all in-vault and inside the
+    // obsidian-backup net), state loaded before the guard is set so the
+    // BaselineStore's live guard reflects the persisted flip from the first
+    // write after load.
+    const migration: Migration = buildMigration({
+      io: {
+        exists: (p) => sessionAdapter.exists(p),
+        read: (p) => sessionAdapter.read(p),
+        write: (p, d) => sessionAdapter.write(p, d),
+        append: (p, d) => sessionAdapter.append(p, d),
+        mkdir: (p) => sessionAdapter.mkdir(p),
+      },
+      paths: {
+        govDir: `${pluginDir}/governance`,
+        acceptanceLog: acceptanceLogFile,
+        pendingIndex: `${pluginDir}/governance/pending-index.json`,
+        baselinesDir: `${pluginDir}/governance/baselines`,
+        legacyEvidence: `${pluginDir}/governance/legacy-evidence.jsonl`,
+        cutoverState: `${pluginDir}/governance/cutover.json`,
+      },
+      baselines: () => baselinesOf(this),
+      now: () => Date.now(),
+    });
+    migrations.set(this, migration);
+    // AWAITED, not fire-and-forget: until the persisted state is read,
+    // isCutOver() would answer from the default (not cut over), so on a
+    // vault that HAS cut over a legacy write could slip through the load
+    // window — and a swallowed load failure would leave two standing
+    // writers permanently (review finding). A loadState failure itself
+    // reads as corrupt inside the store and fails toward fewer writers.
+    await migration.loadState();
+    setLegacyWriteGuard(this, () => !migration.isCutOver());
+
     admissionFactories.set(this, () =>
       buildAdmission({
         repo: lazyHistoryRepo,
@@ -929,6 +968,7 @@ export default class VaultMcpPlugin extends Plugin {
           getConfig: () => (this.settings.modules?.acceptance?.config ?? {}) as Record<string, unknown>,
           // Built fresh per mount, handed as an argument (§9: never a property).
           admission: admissionFactories.get(this)?.(),
+          migration: migrations.get(this),
         });
       } catch (e) {
         console.error("[governor] governance pane wiring failed", e);

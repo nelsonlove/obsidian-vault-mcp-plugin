@@ -83,6 +83,8 @@ import {
 } from "../kernel/governance/accept.js";
 import { buildProposedList, type ProposedItem } from "../kernel/governance/proposed.js";
 import { insertRevisionRequest, withdrawRevisionRequests } from "../kernel/governance/revision.js";
+import { runGuardedDisposition } from "../kernel/governance/gesture.js";
+import { LegacyWriterDisabledError } from "../kernel/governance/migration/cutover.js";
 import { contentHash } from "../kernel/governance/hash.js";
 import {
   AUTHORIZED_CLASSES,
@@ -112,18 +114,7 @@ import {
   selectAcceptEligible,
   type AcceptEligibilityCtx,
 } from "../kernel/governance/menu-eligibility.js";
-import {
-  GovernanceReviewView,
-  VIEW_TYPE_GOVERNANCE,
-  confirmAdopt,
-  confirmMenuAccept,
-  renderAllowlist,
-  wireAdoptButton,
-  ADOPT_BASELINE_DESC,
-  acceptThroughGate,
-  type ReviewController,
-  type RevisingItem,
-} from "./pane.js";
+import { GovernanceReviewView, VIEW_TYPE_GOVERNANCE, confirmAdopt, confirmMenuAccept, renderAllowlist, wireAdoptButton, ADOPT_BASELINE_DESC, acceptThroughGate, type ReviewController, type RevisingItem, renderLegacyRetiredNotice, confirmCutover, confirmRollbackCutover } from "./pane.js";
 import { isExcludedTerritory } from "./territories.js";
 
 // Guarded territories moved to ./territories.ts when observation capture became
@@ -153,11 +144,38 @@ export interface GovernanceWireDeps {
    * Absent ⇒ the pane simply has no governed-proposals section.
    */
   admission?: import("./admission-wiring.js").AdmissionUiDeps;
+  /** WP8: the migration surface (import / cutover / rollback), built in main.ts. Absent ⇒ no migration section and legacy controls stay live. */
+  migration?: import("./migration-wiring.js").Migration;
 }
 
 // ── module-private per-plugin state (WeakMaps, keyed by the plugin instance) ──
 // None of this is reachable by walking `app`: the WeakMap bindings are module-local and their
 // entries are not enumerable.
+
+// WP8: per-plugin cutover guard for the BaselineStore — returns true while
+// legacy is authoritative, false after the cutover (then setBaseline/rekey
+// REFUSE). Set by main.ts from the migration wiring's isCutOver().
+const legacyWriteGuards = new WeakMap<Plugin, () => boolean>();
+export function setLegacyWriteGuard(plugin: Plugin, writeAllowed: () => boolean): void {
+  legacyWriteGuards.set(plugin, writeAllowed);
+}
+
+// WP8: the migration surface, held module-privately so the settings tab
+// (which receives only the plugin) can reach the same instance the pane's
+// controller uses. Confers no accept capability — import/cutover/rollback
+// are themselves gesture-gated at their buttons.
+const migrations = new WeakMap<Plugin, import("./migration-wiring.js").Migration>();
+function migrationOf(plugin: Plugin): import("./migration-wiring.js").Migration | undefined {
+  return migrations.get(plugin);
+}
+function legacyRetired(plugin: Plugin): boolean {
+  return migrationOf(plugin)?.isCutOver() ?? false;
+}
+
+/** WP8: the loaded baseline records, for the migration wiring's import (read-only; content stays in the store). */
+export function baselinesOf(plugin: Plugin): readonly import("../kernel/governance/baseline-store.js").Baseline[] {
+  return baselineStores.get(plugin)?.all() ?? [];
+}
 
 const baselineStores = new WeakMap<Plugin, BaselineStore>();
 function getStore(plugin: Plugin): BaselineStore {
@@ -524,6 +542,13 @@ async function performAccept(plugin: Plugin, path: string, opts?: AcceptOpts): P
   // pre-click typing record cannot ride a reconcile that fires MID-accept (a slow stamp +
   // re-read can outlast the 1200ms debounce), and in `finally`, because a partially-failed
   // accept (stamp landed, baseline advance threw) has still written.
+  // WP8: refused at ENTRY, before the frontmatter stamp — acceptNote stamps
+  // the accepted family FIRST and advances the baseline second, so letting
+  // the store guard be the only stop leaves a note permanently stamped
+  // `acceptance-status: accepted` with no baseline advance and no admission
+  // (a half-write on a human-authority surface; review finding). The typed
+  // error reaches the pane's existing accept-failure Notice paths.
+  if (legacyRetired(plugin)) throw new LegacyWriterDisabledError("accept (legacy acceptance)");
   humanInputMap(plugin).delete(path);
   try {
     return await acceptNote(buildAcceptDeps(plugin), path, opts);
@@ -533,6 +558,10 @@ async function performAccept(plugin: Plugin, path: string, opts?: AcceptOpts): P
   }
 }
 async function performRevert(plugin: Plugin, path: string): Promise<void> {
+  // WP8: revert-to-legacy-baseline exercises the legacy authority record —
+  // retired with the rest of the accept class (the new path's revert is the
+  // admission surface's revertToBase).
+  if (legacyRetired(plugin)) throw new LegacyWriterDisabledError("revert (legacy baseline restore)");
   await revertNote(buildAcceptDeps(plugin), path);
   await refresh(plugin);
 }
@@ -649,6 +678,7 @@ function acceptanceStatusFor(plugin: Plugin, path: string): string | null {
 // stored on the plugin. Built fresh per view instantiation.
 function buildController(plugin: Plugin, admission?: import("./admission-wiring.js").AdmissionUiDeps): ReviewController {
   return {
+    legacyRetired: () => legacyRetired(plugin),
     // WP6b-2: the governed-proposals surface. Read + two gesture-gated acts,
     // reachable only through the pane rows below — the same reachability
     // class as accept/revert/adopt above.
@@ -1184,6 +1214,7 @@ export async function wireGovernance(plugin: Plugin, deps: GovernanceWireDeps): 
     renameRecordsPath: `${govDir}/rename-records.json`,
   });
   configReaders.set(plugin, deps.getConfig);
+  if (deps.migration) migrations.set(plugin, deps.migration);
 
   // The governance dir must exist before anything beside the baselines writes into it
   // (acceptance log appends, the published pending index, rename records).
@@ -1193,7 +1224,14 @@ export async function wireGovernance(plugin: Plugin, deps: GovernanceWireDeps): 
     console.error("governor acceptance: failed to ensure governance dir", e);
   }
 
-  const store = new BaselineStore(new AdapterBlobFs(plugin.app.vault.adapter), paths(plugin).baseDir);
+  // WP8: every legacy baseline write consults the cutover guard LIVE. The
+  // guard slot is set by main.ts once the migration wiring loads its state;
+  // until then legacy writes are allowed (pre-cutover is the default, and the
+  // stored state is what makes the flip durable).
+  const store = new BaselineStore(new AdapterBlobFs(plugin.app.vault.adapter), paths(plugin).baseDir, () => {
+    const guard = legacyWriteGuards.get(plugin);
+    return guard ? guard() : true;
+  });
   baselineStores.set(plugin, store);
   // All awaits happen BEFORE any registration below: if the store fails to load, nothing has been
   // registered and the caller (which never received a Component) has nothing to unmount.
@@ -1531,6 +1569,15 @@ export function renderGovernanceSettings(plugin: Plugin, containerEl: HTMLElemen
     return;
   }
 
+  // WP8: the migration section renders FIRST (status + import + the
+  // human-confirmed cutover / rollback), and after the cutover the legacy
+  // accept-class controls below are replaced by the shared retirement notice.
+  renderMigrationSection(containerEl, plugin);
+  if (legacyRetired(plugin)) {
+    renderLegacyRetiredNotice(containerEl);
+    return;
+  }
+
   // Adopt-baseline — the same gesture- + confirmation-gated action as the pane's Adopt button,
   // shown here with its fuller description. The button holds no accept capability; wireAdoptButton
   // closes over the module-scope performAdopt, reached only when runGuardedAdopt reports "done".
@@ -1562,5 +1609,82 @@ function renderGovernanceAllowlistSection(containerEl: HTMLElement, plugin: Plug
     authorizedClasses: () => AUTHORIZED_CLASSES,
     isClassEnabled: (id) => isClassEnabled(plugin, id),
     setClassEnabled: (id, on, evt) => setClassEnabled(plugin, id, on, evt),
+  });
+}
+
+// ── WP8: the migration section (settings tab) ────────────────────────────────
+// Import is gesture-gated; cutover and rollback are gesture- AND
+// confirmation-gated through runGuardedDisposition — the SAME gate admission
+// uses, so the gestureRef the state records was minted by the shared
+// module-private mint, after isRealGesture and after the human confirmed.
+function renderMigrationSection(containerEl: HTMLElement, plugin: Plugin): void {
+  const migration = migrationOf(plugin);
+  if (!migration) return;
+  containerEl.createEl("h4", { text: "Authority migration (WP8)" });
+  const statusEl = containerEl.createEl("p", { cls: "setting-item-description", text: "Reading migration status…" });
+  void migration
+    .status()
+    .then((st) => {
+      statusEl.setText(
+        `Cutover: ${st.cutOver ? `DONE (admission is the only standing authority)` : "not run (legacy acceptance is authoritative)"}` +
+          (st.corrupt ? " — STATE FILE CORRUPT: legacy writes refuse until repaired or the flow re-runs." : "") +
+          ` Evidence records imported: ${st.evidenceRecords}.`
+      );
+    })
+    .catch((e) => statusEl.setText(`Migration status could not be read: ${e instanceof Error ? e.message : String(e)}`));
+
+  const row = containerEl.createDiv({ cls: "governance-migration-controls" });
+  const importBtn = row.createEl("button", { text: "Import legacy evidence" });
+  importBtn.addEventListener("click", (evt) => {
+    void runGuardedDisposition(evt, null, async () => {
+      try {
+        const { report, appended, skippedExisting } = await migration.importLegacyEvidence();
+        new Notice(
+          `Legacy import: ${appended} appended, ${skippedExisting} already present (idempotent). ` +
+            `${report.baselines} baseline(s); ${report.acceptanceEvents.humanAccepts} human accept(s), ${report.acceptanceEvents.silentAdvances} silent advance(s) — imported as evidence, never as acceptance.`,
+          12000
+        );
+      } catch (e) {
+        new Notice(`Legacy import failed: ${e instanceof Error ? e.message : String(e)} — nothing partial is authoritative (the store is append-only evidence).`, 12000);
+      }
+    });
+  });
+
+  const cutBtn = row.createEl("button", { cls: "mod-warning", text: "Cut over…" });
+  cutBtn.addEventListener("click", (evt) => {
+    void runGuardedDisposition(
+      evt,
+      async () => {
+        // The report the human confirms is a fresh dry pass over the same
+        // surfaces; the cutover itself re-runs the import (idempotent), so
+        // what was confirmed is what is imported.
+        const { report } = await migration.importLegacyEvidence();
+        return confirmCutover(plugin.app, report);
+      },
+      async (gestureRef) => {
+        try {
+          await migration.cutOver(gestureRef);
+          new Notice("Cutover complete: admission is now the only standing authority. Legacy writers refuse.", 12000);
+        } catch (e) {
+          new Notice(`Cutover did NOT run: ${e instanceof Error ? e.message : String(e)} — legacy remains authoritative.`, 12000);
+        }
+      }
+    );
+  });
+
+  const rollBtn = row.createEl("button", { text: "Roll back cutover…" });
+  rollBtn.addEventListener("click", (evt) => {
+    void runGuardedDisposition(
+      evt,
+      () => confirmRollbackCutover(plugin.app),
+      async (gestureRef) => {
+        try {
+          await migration.rollback(gestureRef);
+          new Notice("Cutover rolled back: legacy acceptance is authoritative again.", 12000);
+        } catch (e) {
+          new Notice(`Rollback did not run: ${e instanceof Error ? e.message : String(e)}`, 12000);
+        }
+      }
+    );
   });
 }

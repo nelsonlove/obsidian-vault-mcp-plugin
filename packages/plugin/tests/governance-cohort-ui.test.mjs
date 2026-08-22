@@ -436,3 +436,47 @@ describe("review regressions — correlation, staleness, concurrency, degradatio
     }
   });
 });
+
+// ── WP8: one gesture, one claim — at RUNTIME, every spelling ────────────────
+
+describe("one-shot gestureRef — a gesture authorises exactly one claim", () => {
+  test("a replayed ref refuses on the item path, the cohort path, and across the two — fresh refs admit (vacuity)", async () => {
+    const h = await harness();
+    try {
+      const a = await h.produce("Shot/a.md", "a0\n", "a1\n");
+      const solo = await h.admission.admitWithGesture(a.id, "gesture-once");
+      assert.ok(solo.ok, JSON.stringify(solo));
+
+      // Item-path replay: a DIFFERENT subject under the used ref.
+      const b = await h.produce("Shot/b.md", "b0\n", "b1\n");
+      const replayItem = await h.admission.admitWithGesture(b.id, "gesture-once");
+      assert.ok(!replayItem.ok, "a used gesture must not authorise a second claim");
+      assert.equal(replayItem.code, "gesture_replayed");
+
+      // Cohort-path replay of the same ref.
+      await h.produce("Shot/c.md", "c0\n", "c1\n");
+      const sel = await h.admission.freezeSelection({ folder: "Shot" }, "item");
+      assert.ok(sel.ok);
+      const replayCohort = await h.admission.admitCohortWithGesture(sel.frozen, sel.members, "gesture-once");
+      assert.ok(!replayCohort.ok);
+      assert.equal(replayCohort.code, "gesture_replayed");
+
+      // Vacuity: the same decisions under FRESH refs admit fine — the
+      // refusal is about the ref, not the subjects.
+      const fresh = await h.admission.admitWithGesture(b.id, "gesture-two");
+      assert.ok(fresh.ok, JSON.stringify(fresh));
+      const sel2 = await h.admission.freezeSelection({ folder: "Shot" }, "item");
+      assert.ok(sel2.ok);
+      const freshCohort = await h.admission.admitCohortWithGesture(sel2.frozen, sel2.members, "gesture-three");
+      assert.ok(freshCohort.ok, JSON.stringify(freshCohort));
+      // And a cohort-used ref refuses on the ITEM path too — the token is
+      // one-shot across BOTH doors.
+      const d = await h.produce("Shot/d.md", "d0\n", "d1\n");
+      const crossReplay = await h.admission.admitWithGesture(d.id, "gesture-three");
+      assert.ok(!crossReplay.ok);
+      assert.equal(crossReplay.code, "gesture_replayed");
+    } finally {
+      h.cleanup();
+    }
+  });
+});

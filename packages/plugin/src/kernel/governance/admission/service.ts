@@ -103,6 +103,26 @@ export function createAdmissionService(deps: AdmissionDeps): AdmissionService {
     return next;
   }
 
+  // ONE GESTURE, ONE CLAIM — enforced at runtime, not only by the pane's
+  // structure (governor-lead's WP8 proposal): a gesture ref is a one-shot
+  // token, so a claim carrying a ref that any existing claim already carries
+  // refuses. This kills every spelling of the successor-reuse violation at
+  // once — recursion, a second direct call, an item-path loop, helper
+  // indirection, and the ones nobody has imagined — and it survives Gate 2,
+  // where mandates admit without a pane to read. Checked INSIDE the
+  // serialized chain beside the duplicate check; empty refs never reach it
+  // (authority_missing refuses them first).
+  async function requireGestureUnused(gestureRef: string): Promise<void> {
+    if (!gestureRef) return;
+    const prior = (await deps.claims.all()).find((c) => c.authority.gestureRef === gestureRef);
+    if (prior) {
+      throw new AdmissionRefusedError(
+        "gesture_replayed",
+        `gesture ${gestureRef} already authorised claim ${prior.id}; one gesture covers exactly one claim — a further decision needs its own gesture`
+      );
+    }
+  }
+
   function deriveCohortCoveredNotes(frozenSubject: CohortSubjectV1): Array<{ vaultId: string; noteId: string; subjectDigest: string }> {
     // DERIVED from the manifest, in the same breath as the digest — the #334
     // shaping rule at cohort scale. subjectDigest(item) here is the same
@@ -125,6 +145,7 @@ export function createAdmissionService(deps: AdmissionDeps): AdmissionService {
         // caller B's coverage ran, refusing healthy members).
         const coverage = await deps.verifyCohort(request.frozenSubject, cohortDigest.value, request.memberProposals);
         requireCohortAdmissible(request, coverage, now);
+        if (request.authority.kind === "human-gesture") await requireGestureUnused(request.authority.gestureRef);
 
         // Duplicate check inside the serialized chain, cohort-shaped: if what
         // stands already covers this exact cohort digest, refuse truthfully.
@@ -168,6 +189,7 @@ export function createAdmissionService(deps: AdmissionDeps): AdmissionService {
         //    an input.
         const outcome = await deps.verify(request.subject);
         requireAdmissible(request, outcome.records, now);
+        if (request.authority.kind === "human-gesture") await requireGestureUnused(request.authority.gestureRef);
         if (!outcome.passed) {
           // requireAdmissible refuses per-record failures with specifics;
           // this is the belt for an outcome failing for any other reason

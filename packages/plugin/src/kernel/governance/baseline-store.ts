@@ -17,6 +17,7 @@
 // the accept-reachability review. ZERO baseline SURFACE is added by moving it.
 
 import { contentHash } from "./hash.js";
+import { LegacyWriterDisabledError } from "./migration/cutover.js";
 
 export interface BlobFs {
   read(path: string): Promise<string>;
@@ -45,7 +46,25 @@ export class BaselineStore {
   private cache = new Map<string, Baseline>();
   private loaded = false;
 
-  constructor(private readonly fs: BlobFs, private readonly baseDir: string) {}
+  /**
+   * @param writeAllowed WP8's cutover guard, read LIVE on every write: when it
+   * returns false, `setBaseline` and `rekey` REFUSE with
+   * LegacyWriterDisabledError — the disabled legacy standing writer actually
+   * refuses rather than merely being unreferenced ("never run two standing
+   * writers concurrently" as a runtime property). Every legacy write path
+   * (Accept, adopt-baseline, silent human advance, auto-accept) funnels
+   * through these two methods, so this is the single choke point. Absent ⇒
+   * allowed (pre-cutover construction, bare embeds, tests).
+   */
+  constructor(
+    private readonly fs: BlobFs,
+    private readonly baseDir: string,
+    private readonly writeAllowed?: () => boolean
+  ) {}
+
+  private requireWritable(op: string): void {
+    if (this.writeAllowed && !this.writeAllowed()) throw new LegacyWriterDisabledError(op);
+  }
 
   async load(): Promise<void> {
     await this.ensureDir();
@@ -90,6 +109,7 @@ export class BaselineStore {
     acceptedBy: string,
     acceptedAt: string = new Date().toISOString(),
   ): Promise<Baseline> {
+    this.requireWritable("setBaseline (the baseline-advance primitive)");
     await this.ensureDir();
     const baseline: Baseline = {
       path,
@@ -118,6 +138,7 @@ export class BaselineStore {
    * leaves a duplicate (harmless: `load` keys by the record's own `path`), never a gap.
    */
   async rekey(oldPath: string, newPath: string): Promise<"moved" | "no-baseline" | "target-exists"> {
+    this.requireWritable("rekey (baseline re-addressing)");
     if (oldPath === newPath) return "no-baseline";
     const existing = this.cache.get(oldPath);
     if (!existing) return "no-baseline";

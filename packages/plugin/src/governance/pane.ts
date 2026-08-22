@@ -62,6 +62,8 @@ export interface RevisingItem {
 
 export interface ReviewController {
   getPending(): PendingItem[];
+  /** WP8: true after the authority cutover — the legacy accept-class controls are retired and their writers refuse. */
+  legacyRetired?(): boolean;
   getBaselineContent(path: string): string | null;
   readCurrent(path: string): Promise<string>;
   // The ONE context-aware accept (#221/#164 convergence): advances the baseline, and — iff
@@ -250,6 +252,39 @@ export async function acceptThroughGate(
   }
 }
 
+/** WP8: the cutover confirmation — the single human-confirmed act that moves authority. The body states what the click means, what is NOT covered by backup (#337), and the fail direction. */
+export function confirmCutover(app: App, report: { baselines: number; totalRecords: number; acceptanceEvents: { humanAccepts: number; silentAdvances: number } }): Promise<boolean> {
+  return new Promise((resolve) => {
+    new ConfirmModal(
+      app,
+      {
+        title: "Cut over: admission becomes the ONLY standing authority",
+        body:
+          `Legacy evidence imported: ${report.totalRecords} record(s) — ${report.baselines} baseline(s), of which ${report.acceptanceEvents.humanAccepts} were human Accept clicks and ${report.acceptanceEvents.silentAdvances} were silent advances (imported as evidence, never as acceptance). ` +
+          "After this click, Accept / adopt-baseline / auto-accept are disabled and refuse; standing advances only through admission. " +
+          "Rollback exists (a human act, in settings). NOTE: the standing chain lives OUTSIDE the vault and outside every backup (issue #337) — confirm a fresh obsidian-backup commit before proceeding; if this act half-lands, legacy remains authoritative.",
+        confirmText: "Cut over",
+      },
+      resolve,
+    ).open();
+  });
+}
+
+/** WP8: the rollback confirmation — legacy becomes authoritative again. */
+export function confirmRollbackCutover(app: App): Promise<boolean> {
+  return new Promise((resolve) => {
+    new ConfirmModal(
+      app,
+      {
+        title: "Roll back the authority cutover",
+        body: "Legacy acceptance (Accept / adopt-baseline / auto-accept) becomes authoritative again and its writers re-enable. Admissions already in the standing chain remain recorded. Continue?",
+        confirmText: "Roll back",
+      },
+      resolve,
+    ).open();
+  });
+}
+
 export function confirmAdopt(app: App): Promise<boolean> {
   return new Promise((resolve) => {
     new ConfirmModal(
@@ -429,6 +464,20 @@ export function renderAllowlist(root: HTMLElement, deps: AllowlistDeps): void {
   }
 }
 
+// WP8 bar item 5: after the cutover, adopt-baseline and the auto-accept
+// allowlist are RETIRED as ordinary operating controls ("a migration
+// bootstrap cannot remain a permanent mass-silence capability"). Both render
+// surfaces call this ONE notice instead of the controls; the store-level
+// guard is the enforcement (a reached control would still refuse), this is
+// the honest UI for it.
+export const LEGACY_RETIRED_TEXT =
+  "Legacy acceptance is retired: the authority cutover has run, so Accept, adopt-baseline and " +
+  "auto-accept are disabled and standing advances only through admission. Rollback (a human act) " +
+  "is available in the plugin settings.";
+export function renderLegacyRetiredNotice(root: HTMLElement): void {
+  root.createDiv({ cls: "governance-legacy-retired", text: LEGACY_RETIRED_TEXT });
+}
+
 // The ONE adopt-baseline button wiring — gesture- AND confirmation-gated. The button is wired via
 // addEventListener (its `.onclick` stays null → unreachable to renderer-JS); the handler runs the
 // action ONLY when runGuardedAdopt reports "done" (a real trusted gesture AND a human confirm).
@@ -441,8 +490,15 @@ export function wireAdoptButton(
   onDone: () => void | Promise<void>,
 ): void {
   btn.addEventListener("click", async (evt) => {
-    const outcome = await runGuardedAdopt(evt, confirm, adopt);
-    if (outcome === "done") await onDone();
+    try {
+      const outcome = await runGuardedAdopt(evt, confirm, adopt);
+      if (outcome === "done") await onDone();
+    } catch (e) {
+      // A stale-rendered button after the WP8 cutover reaches the store
+      // guard's typed refusal — surfaced as a Notice, never an unhandled
+      // rejection with no user feedback (review finding).
+      new Notice(`Adopt failed: ${e instanceof Error ? e.message : String(e)}`, 10000);
+    }
   });
 }
 
@@ -563,20 +619,24 @@ export class GovernanceReviewView extends ItemView {
     // Adopt-baseline is a genuine-user-gesture UI action (NOT a command, NOT an instance method).
     // It closes over `deps.adopt` here; the handler is wired via addEventListener (onclick stays
     // null → the function is unreachable to renderer-JS) and is gesture-gated AND confirmation-
-    // gated, since adopting silences the whole queue.
-    const adoptBtn = header.createEl("button", { cls: "governance-adopt", text: "Adopt baseline" });
-    adoptBtn.title = ADOPT_BASELINE_DESC; // same single-sourced copy the settings tab shows
-    // Gesture- AND confirmation-gated via the shared wireAdoptButton (one implementation, shared
-    // with the settings tab). onDone fires only on a confirmed real gesture.
-    wireAdoptButton(
-      adoptBtn,
-      () => confirmAdopt(this.app),
-      () => deps.adopt(),
-      async () => {
-        new Notice("governor acceptance: baseline adopted — the vault is now reviewable.");
-        await this.rerender();
-      },
-    );
+    // gated, since adopting silences the whole queue. WP8: RETIRED after the
+    // cutover — the button is not rendered (and the store guard would refuse
+    // it anyway; the UI just says so honestly).
+    if (!(deps.legacyRetired?.() ?? false)) {
+      const adoptBtn = header.createEl("button", { cls: "governance-adopt", text: "Adopt baseline" });
+      adoptBtn.title = ADOPT_BASELINE_DESC; // same single-sourced copy the settings tab shows
+      // Gesture- AND confirmation-gated via the shared wireAdoptButton (one implementation, shared
+      // with the settings tab). onDone fires only on a confirmed real gesture.
+      wireAdoptButton(
+        adoptBtn,
+        () => confirmAdopt(this.app),
+        () => deps.adopt(),
+        async () => {
+          new Notice("governor acceptance: baseline adopted — the vault is now reviewable.");
+          await this.rerender();
+        },
+      );
+    }
 
     if (this.selected && pending.some((p) => p.path === this.selected)) {
       await this.renderDetail(root, pending.find((p) => p.path === this.selected)!);
@@ -598,8 +658,10 @@ export class GovernanceReviewView extends ItemView {
       // pane a superset of the retired js-engine panel.
       this.renderRevising(root, deps);
       // The auto-accept allowlist section — HUMAN-ONLY-MUTABLE, gesture-gated. Rendered via the
-      // shared renderAllowlist (one implementation, shared with the settings tab).
-      renderAllowlist(root, deps);
+      // shared renderAllowlist (one implementation, shared with the settings tab). WP8: retired
+      // after the cutover, replaced by the shared notice.
+      if (deps.legacyRetired?.() ?? false) renderLegacyRetiredNotice(root);
+      else renderAllowlist(root, deps);
     }
   }
 
@@ -613,6 +675,18 @@ export class GovernanceReviewView extends ItemView {
   // if a real click happened.
   private async renderGovernedProposals(root: HTMLElement, deps: ReviewController): Promise<void> {
     if (!deps.admission) return;
+    // #337 option 4: the claims-exist-chain-absent state surfaces as a LOUD
+    // banner — the resolver's "ungoverned" answers must not read as truth
+    // while the standing chain is missing. Rendered before anything else in
+    // this section; a health-probe failure never breaks the pane.
+    try {
+      const health = await deps.admission.standingHealth();
+      if (health.status === "critical") {
+        root.createDiv({ cls: "governance-standing-critical", text: `STANDING HEALTH CRITICAL [${health.code}]: ${health.detail}` });
+      }
+    } catch {
+      /* the probe itself failing must not hide the proposals */
+    }
     let items: import("../kernel/governance/proposals/proposal.js").ProposalV1[] = [];
     try {
       items = await deps.admission.pending();

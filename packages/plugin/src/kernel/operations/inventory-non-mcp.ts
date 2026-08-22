@@ -100,6 +100,17 @@ export const WIRING_EXPORTS = [
   "nudgeGovernanceQueue",
   "wireGovernance",
   "renderGovernanceSettings",
+  // WP8 (each confirmed accept-closure-free): setLegacyWriteGuard REGISTERS a
+  // boolean predicate (main.ts's cutover check) consulted by the BaselineStore
+  // — it holds no accept callable. It is NOT monotone (a later call installing
+  // () => true would re-enable legacy writes post-cutover); what protects it
+  // is the module-privacy threat model — the WeakMap and this export are
+  // unreachable from `app`, same as every accept-perimeter closure (review
+  // finding: say the real reason, not a monotonicity the function lacks).
+  // baselinesOf is a read-only view of the loaded baseline records for the
+  // migration import (no store handle escapes).
+  "setLegacyWriteGuard",
+  "baselinesOf",
 ] as const;
 
 export interface AuthorityRow {
